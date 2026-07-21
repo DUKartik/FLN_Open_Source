@@ -28,6 +28,10 @@ import {
 } from './db/index.js';
 import { createLogger, type Logger } from './logger.js';
 import { healthRoutes } from './routes/health.routes.js';
+import {
+  createKeyManager,
+} from './infrastructure/key-providers/index.js';
+import type { KeyManager } from './application/ports/key-manager.js';
 
 export interface BuildServerOptions {
   config?: Config;
@@ -43,11 +47,19 @@ export interface BuildServerOptions {
   db?: Database;
   /** Disable DB check in /health/ready (debug/diagnostic use only). */
   disableDbCheck?: boolean;
+  /**
+   * Optional KeyManager override. When omitted, the server constructs
+   * one via the factory; the factory fires the production-safety guard
+   * (refuses `KEY_PROVIDER=local-dev` in production without override).
+   * Tests can pass a fully-built KeyManager to bypass the factory.
+   */
+  keyManager?: KeyManager;
 }
 
 declare module 'fastify' {
   interface FastifyInstance {
     db?: Database;
+    keyManager?: KeyManager;
   }
 }
 
@@ -86,6 +98,18 @@ export async function buildServer(
     app.db = await createMemoryDatabase();
   }
 
+  // Wire the KeyManager. Explicit override wins; otherwise the factory
+  // dispatches on `KEY_PROVIDER` (default `local-dev`). The factory is
+  // the single place that enforces the production-safety guard, so
+  // every KeyManager that lives on a Fastify instance has already been
+  // vetted. If construction throws we DO NOT swallow it — the server
+  // refuses to boot, which is the only safe behaviour.
+  if (options.keyManager !== undefined) {
+    app.keyManager = options.keyManager;
+  } else {
+    app.keyManager = createKeyManager({ config, logger });
+  }
+
   app.setErrorHandler((err, _req, reply) => {
     // Log the error with the request context. The response shape is intentionally
     // minimal — the vault never echoes internal error messages to the caller
@@ -108,6 +132,7 @@ export async function buildServer(
   await app.register(healthRoutes, {
     deps: {
       version: '0.1.0',
+      keyManager: () => app.keyManager,
       isReady: async () => {
         if (options.disableDbCheck) return true;
         if (!app.db) return false;

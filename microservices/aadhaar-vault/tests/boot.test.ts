@@ -30,6 +30,9 @@ describe('aadhaar-vault boot', () => {
         PORT: 4101,
         HOST: '127.0.0.1',
         LOG_LEVEL: 'silent',
+        KEY_PROVIDER: 'local-dev',
+        LOCAL_DEV_MASTER_KEY: Buffer.alloc(32, 0x42).toString('base64'),
+        KEY_VERSION: 'kv-1',
       },
     });
     await app.ready();
@@ -57,18 +60,17 @@ describe('aadhaar-vault boot', () => {
     expect(res.json()).toEqual({ status: 'alive' });
   });
 
-  it('GET /health/ready returns 200 with postgres ok', async () => {
+  it('GET /health/ready returns 200 with postgres + keyProvider ok', async () => {
     const res = await app!.inject({ method: 'GET', url: '/health/ready' });
     expect(res.statusCode).toBe(200);
     const body = res.json() as Record<string, Record<string, string>>;
     expect(body.status).toBe('ready');
-    // Postgres reachability is now wired through `pg-mem`'s in-process
-    // pool, so the readiness probe reports `'ok'`. The key-provider
-    // reachability check is intentionally deferred to Session 3.
-    // `noUncheckedIndexedAccess` makes any record-dict access `T | undefined`
-    // at the type level; the route handler guarantees the keys exist.
+    // Postgres reachability is wired through `pg-mem`'s in-process pool;
+    // Session 3 wired the KeyManager factory so the readiness probe also
+    // reports the key subsystem as `ok` whenever `app.keyManager.info()`
+    // returns a non-empty `currentVersion`.
     expect(body.checks!.postgres).toBe('ok');
-    expect(body.checks!.keyProvider).toBe('deferred-session-3');
+    expect(body.checks!.keyProvider).toBe('ok');
   });
 
   it('returns a JSON 404 for unknown routes (not HTML)', async () => {

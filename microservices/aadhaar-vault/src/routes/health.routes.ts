@@ -6,10 +6,15 @@
  *   - GET /health/live  — Kubernetes-style liveness; returns 200 always.
  *   - GET /health/ready — Kubernetes-style readiness; reports dependency status.
  *
- * Session 2 wires a real Postgres ping via the `isReady` dep. Session 3
- * will add a key-provider reachability check alongside it.
+ * Session 2 wired the Postgres ping. Session 3 adds the key-provider
+ * readiness check alongside it — verifying that `app.keyManager.info()`
+ * returns a non-empty `currentVersion`. Authentication and authorisation
+ * are deliberately not wired here; this route is public by design.
  */
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
+import type { KeyManager } from '../application/ports/key-manager.js';
+
+export type KeyProviderStatus = 'ok' | 'down' | 'not-configured';
 
 export interface HealthDeps {
   version: string;
@@ -20,6 +25,12 @@ export interface HealthDeps {
    * with the reason inline.
    */
   isReady: () => Promise<boolean>;
+  /**
+   * Resolves the current KeyManager instance from the Fastify server.
+   * Returned synchronously because wiring happens at boot; we keep the
+   * shape as a function so future lazy composition is friction-free.
+   */
+  keyManager: () => KeyManager | undefined;
 }
 
 export const healthRoutes: FastifyPluginAsync<{ deps: HealthDeps }> = async (
@@ -37,13 +48,23 @@ export const healthRoutes: FastifyPluginAsync<{ deps: HealthDeps }> = async (
 
   app.get('/health/ready', async (_req, reply) => {
     const ok = await deps.isReady();
-    if (!ok) {
+    const keyStatus: KeyProviderStatus = (() => {
+      const km = deps.keyManager();
+      if (!km) return 'not-configured';
+      const info = km.info();
+      if (!info || !info.currentVersion || info.currentVersion.length === 0) {
+        return 'down';
+      }
+      return 'ok';
+    })();
+
+    if (!ok || keyStatus !== 'ok') {
       reply.code(503);
       return {
         status: 'not_ready',
         checks: {
-          postgres: 'unreachable',
-          keyProvider: 'deferred-session-3',
+          postgres: ok ? 'ok' : 'unreachable',
+          keyProvider: keyStatus,
         },
       };
     }
@@ -51,7 +72,7 @@ export const healthRoutes: FastifyPluginAsync<{ deps: HealthDeps }> = async (
       status: 'ready',
       checks: {
         postgres: 'ok',
-        keyProvider: 'deferred-session-3',
+        keyProvider: 'ok',
       },
     };
   });
