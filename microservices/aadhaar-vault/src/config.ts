@@ -29,8 +29,11 @@ const ConfigSchema = z.object({
   HOST: z.string().min(1).default('0.0.0.0'),
   LOG_LEVEL: LogLevel.default('info'),
 
-  // Deferred to Session 2
-  VAULT_DB_URI: z.string().url().optional(),
+  // Session 2: Postgres connection. Required at boot when NODE_ENV is
+  // anything other than `test`. We declare it optional here and enforce
+  // the requirement in `loadConfig` so the test environment can boot
+  // without a DB URI (tests wire their own pg-mem instance directly).
+  VAULT_DB_URI: z.string().min(1).optional(),
 
   // Deferred to Session 3
   KEY_PROVIDER: z.string().min(1).optional(),
@@ -69,6 +72,16 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const cfg = parsed.data;
+
+  // Session 2: refuse to boot in non-test environments without a DB URI.
+  // Tests skip this guard because they wire pg-mem directly without going
+  // through `process.env`.
+  if (cfg.NODE_ENV !== 'test' && !cfg.VAULT_DB_URI) {
+    throw new Error(
+      '[aadhaar-vault] VAULT_DB_URI is required when NODE_ENV != "test". ' +
+        'Set it to a postgres:// connection string.',
+    );
+  }
 
   // Production safety guards (architecture doc §5.1).
   // These are dormant in development so the dev DX is not blocked.

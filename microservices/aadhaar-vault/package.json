@@ -17,12 +17,14 @@
   },
   "dependencies": {
     "fastify": "^4.28.1",
+    "pg": "^8.13.1",
     "pino": "^9.5.0",
     "pino-pretty": "^11.3.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^22.7.5",
+    "@types/pg": "^8.11.10",
     "tsx": "^4.19.2",
     "typescript": "~5.6.3",
     "vitest": "^2.1.4"

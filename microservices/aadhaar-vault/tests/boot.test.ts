@@ -5,7 +5,7 @@
  *  1. `buildServer()` returns a Fastify instance without throwing.
  *  2. `GET /health` returns 200 with the expected shape.
  *  3. `GET /health/live` returns 200.
- *  4. `GET /health/ready` returns 200.
+ *  4. `GET /health/ready` returns 200 (postgres: 'ok' via pg-mem).
  *  5. `GET /no-such-route` returns a JSON 404 (not HTML).
  *  6. Pino redact path `req.headers.authorization` is honoured.
  *
@@ -17,7 +17,11 @@ import type { FastifyInstance } from 'fastify';
 import { buildServer } from '../src/server.js';
 
 describe('aadhaar-vault boot', () => {
-  let app: FastifyInstance;
+  // Optional `app` so `afterAll` survives a `beforeAll` that threw
+  // before assignment; vitest still re-throws the original failure.
+  // `app!.inject(...)` below is sound because vitest only runs the
+  // bodies after `beforeAll` resolves successfully.
+  let app: FastifyInstance | undefined;
 
   beforeAll(async () => {
     app = await buildServer({
@@ -32,11 +36,13 @@ describe('aadhaar-vault boot', () => {
   });
 
   afterAll(async () => {
-    await app.close();
+    if (app) {
+      await app.close();
+    }
   });
 
   it('GET /health returns 200 with the expected payload', async () => {
-    const res = await app.inject({ method: 'GET', url: '/health' });
+    const res = await app!.inject({ method: 'GET', url: '/health' });
     expect(res.statusCode).toBe(200);
     const body = res.json() as Record<string, unknown>;
     expect(body.status).toBe('ok');
@@ -46,24 +52,27 @@ describe('aadhaar-vault boot', () => {
   });
 
   it('GET /health/live returns 200 with status:alive', async () => {
-    const res = await app.inject({ method: 'GET', url: '/health/live' });
+    const res = await app!.inject({ method: 'GET', url: '/health/live' });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ status: 'alive' });
   });
 
-  it('GET /health/ready returns 200 with deferred deps', async () => {
-    const res = await app.inject({ method: 'GET', url: '/health/ready' });
+  it('GET /health/ready returns 200 with postgres ok', async () => {
+    const res = await app!.inject({ method: 'GET', url: '/health/ready' });
     expect(res.statusCode).toBe(200);
     const body = res.json() as Record<string, Record<string, string>>;
     expect(body.status).toBe('ready');
+    // Postgres reachability is now wired through `pg-mem`'s in-process
+    // pool, so the readiness probe reports `'ok'`. The key-provider
+    // reachability check is intentionally deferred to Session 3.
     // `noUncheckedIndexedAccess` makes any record-dict access `T | undefined`
-    // at the type level; the route handler guarantees the key exists.
-    expect(body.checks!.postgres).toBe('deferred-session-2');
+    // at the type level; the route handler guarantees the keys exist.
+    expect(body.checks!.postgres).toBe('ok');
     expect(body.checks!.keyProvider).toBe('deferred-session-3');
   });
 
   it('returns a JSON 404 for unknown routes (not HTML)', async () => {
-    const res = await app.inject({ method: 'GET', url: '/no-such-route' });
+    const res = await app!.inject({ method: 'GET', url: '/no-such-route' });
     expect(res.statusCode).toBe(404);
     expect(res.headers['content-type']).toMatch(/application\/json/);
     const body = res.json() as Record<string, unknown>;
@@ -71,7 +80,7 @@ describe('aadhaar-vault boot', () => {
   });
 
   it('redacts Authorization headers in the log', async () => {
-    const res = await app.inject({
+    const res = await app!.inject({
       method: 'GET',
       url: '/health',
       headers: { authorization: 'Bearer super-secret-token' },

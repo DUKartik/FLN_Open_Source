@@ -6,26 +6,49 @@
  *  - Build the Pino logger with PII redaction.
  *  - Register a JSON body parser with a hard size cap.
  *  - Register the health routes.
- *  - Wire graceful SIGINT/SIGTERM shutdown.
+ *  - Wire the Postgres pool + repositories on the Fastify instance as
+ *    `app.db`. Health probes use this to ping the database.
+ *  - Wire graceful SIGINT/SIGTERM shutdown (closes both Fastify and DB).
  *
- * Session 1 does NOT yet wire:
- *  - Database pool (Session 2)
- *  - Crypto module (Session 3)
- *  - JWT/MFA auth (Session 4)
- *  - Swagger UI / OpenAPI (Session 5)
+ * Session 2 wires the DB. Sessions 3–5 (crypto, auth, OpenAPI) plug in
+ * the same way: an instance decorator + a graceful shutdown hook.
  */
 import Fastify, {
   type FastifyBaseLogger,
   type FastifyInstance,
   type RawServerDefault,
 } from 'fastify';
+
 import { loadConfig, type Config } from './config.js';
+import {
+  createDatabase,
+  createMemoryDatabase,
+  pingPool,
+  type Database,
+} from './db/index.js';
 import { createLogger, type Logger } from './logger.js';
 import { healthRoutes } from './routes/health.routes.js';
 
 export interface BuildServerOptions {
   config?: Config;
   logger?: Logger;
+  /**
+   * Optional DB override. If supplied, used verbatim (e.g. a test
+   * passes a pg-mem-backed `Database`). When omitted, the server
+   * derives the DB from `config`:
+   *   - `VAULT_DB_URI` set → real Postgres pool.
+   *   - `NODE_ENV === 'test'` with no URI → pg-mem (in-process).
+   *   - otherwise → undefined; routes that need the DB will fail loudly.
+   */
+  db?: Database;
+  /** Disable DB check in /health/ready (debug/diagnostic use only). */
+  disableDbCheck?: boolean;
+}
+
+declare module 'fastify' {
+  interface FastifyInstance {
+    db?: Database;
+  }
 }
 
 export async function buildServer(
@@ -36,8 +59,6 @@ export async function buildServer(
 
   // Pin the Logger generic to FastifyBaseLogger so the instance type matches
   // the FastifyInstance<...FastifyBaseLogger...> declared by the public API.
-  // Pino's richer `Logger` type is structurally a super-set; we keep it for
-  // runtime use but erase it at the boundary.
   const app = Fastify<
     RawServerDefault,
     import('http').IncomingMessage,
@@ -51,6 +72,19 @@ export async function buildServer(
     requestIdLogLabel: 'reqId',
     disableRequestLogging: false,
   });
+
+  // Wire the DB. Explicit override wins, then VAULT_DB_URI, then test
+  // fallback. If none apply (e.g. production misconfig that the loader
+  // already rejected) we leave `app.db` undefined and the readiness
+  // probe reports it as `null` — that's a defence-in-depth signal, not
+  // the primary guard.
+  if (options.db !== undefined) {
+    app.db = options.db;
+  } else if (config.VAULT_DB_URI) {
+    app.db = await createDatabase({ uri: config.VAULT_DB_URI, logger });
+  } else if (config.NODE_ENV === 'test') {
+    app.db = await createMemoryDatabase();
+  }
 
   app.setErrorHandler((err, _req, reply) => {
     // Log the error with the request context. The response shape is intentionally
@@ -71,7 +105,31 @@ export async function buildServer(
     });
   });
 
-  await app.register(healthRoutes, { deps: { version: '0.1.0' } });
+  await app.register(healthRoutes, {
+    deps: {
+      version: '0.1.0',
+      isReady: async () => {
+        if (options.disableDbCheck) return true;
+        if (!app.db) return false;
+        try {
+          await pingPool(app.db.pool);
+          return true;
+        } catch (err) {
+          app.log.error({ err }, 'aadhaar-vault readiness probe failed');
+          return false;
+        }
+      },
+    },
+  });
+
+  // On close, drain the DB pool too. We only close pools that this
+  // builder created — if the caller passed their own db, they're
+  // responsible for closing it.
+  app.addHook('onClose', async () => {
+    if (app.db && options.db === undefined) {
+      await app.db.close();
+    }
+  });
 
   return app;
 }

@@ -136,6 +136,18 @@ Test Files  1 passed (1)
 
 If you see this, the bootstrap is verified.
 
+> **Test stack note (Session 2+):** subsequent sessions add the schema
+> and four repository adapters under `src/db/adapters/`. Their tests
+> run against an **in-process `MemoryPool`** (see
+> `src/db/memory-pool.ts`) that pre-declares the four-table schema and
+> parses the SQL the adapters actually emit. Anything outside that
+> envelope throws, so a divergent query is caught in CI rather than
+> silently returning the wrong rows. We do **not** use `pg-mem` — its
+> parser hung on our production DDL (`BYTEA`, `JSONB`, `BIGSERIAL`,
+> `timestamptz`, partial indexes). `pg` remains the production driver
+> and runs the migrations against the bundled Postgres from
+> `docker compose up postgres`.
+
 ## What is NOT in Session 1
 
 Per the implementation rules: **all generated code compiles, no TODOs,
