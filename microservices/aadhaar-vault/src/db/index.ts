@@ -1,10 +1,11 @@
 /**
  * Database wiring module.
  *
- * Produces a ready-to-use {@link Database} object containing the pool
- * and four repository instances. The factory is intentionally thin so
- * that any future orchestration (transactions, replicas, read-only
- * pools) lives in one file rather than scattered across repositories.
+ * Produces a ready-to-use {@link Database} object containing the pool,
+ * the five repository instances, and a transactional vault writer.
+ * The factory is intentionally thin so that any future orchestration
+ * (transactions, replicas, read-only pools) lives in one file rather
+ * than scattered across repositories.
  *
  * Usage (production):
  *
@@ -13,8 +14,10 @@
  *       logger: childLogger,
  *   });
  *
- *   const token = await db.identities.insert({...});
- *   await db.audit.append({...});
+ *   const token = await db.vaultWriter.runWrite(async (conn) => {
+ *       await conn.insertIdentity({...});
+ *       return conn.insertToken({...});
+ *   });
  *
  * In production, call `await db.close()` from the shutdown handler.
  * Tests get the same shape via `createMemoryDatabase()` which uses a
@@ -32,6 +35,9 @@
  */
 import type { FastifyBaseLogger } from 'fastify';
 
+import type {
+    TransactionalVaultWriter,
+} from '../application/ports/transactional-vault-writer.js';
 import {
     PostgresAuditRepository,
 } from './adapters/audit.postgres.js';
@@ -44,12 +50,22 @@ import {
 import {
     PostgresMfaRepository,
 } from './adapters/mfa.postgres.js';
+import {
+    PostgresTokenRepository,
+} from './adapters/token.postgres.js';
+import {
+    MemoryTransactionalVaultWriter,
+} from './adapters/memory-transactional-vault-writer.js';
+import {
+    PostgresTransactionalVaultWriter,
+} from './adapters/postgres-transactional-vault-writer.js';
 import { MemoryPool, type TableSpec } from './memory-pool.js';
 import { runMigrations } from './migrator.js';
 import type { AuditRepository } from './ports/audit.repository.js';
 import type { IdentityRepository } from './ports/identity.repository.js';
 import type { KeyMetadataRepository } from './ports/key-metadata.repository.js';
 import type { MfaRepository } from './ports/mfa.repository.js';
+import type { TokenRepository } from './ports/token.repository.js';
 import {
     createMemoryPool,
     createRealPool,
@@ -65,6 +81,14 @@ export interface Database {
     audit: AuditRepository;
     mfa: MfaRepository;
     keyMetadata: KeyMetadataRepository;
+    tokens: TokenRepository;
+    /**
+     * Transactional writer that bundles the three writes issued by
+     * `TokenizeAadhaar` (insert identity, insert token, append audit)
+     * into a single atomic unit. The production wiring uses a real
+     * Postgres transaction; test wiring uses the in-memory variant.
+     */
+    vaultWriter: TransactionalVaultWriter;
     close(): Promise<void>;
 }
 
@@ -102,7 +126,8 @@ export async function createDatabase(
         }
     }
 
-    return assembleDb(pool);
+    const writer = new PostgresTransactionalVaultWriter(pool);
+    return assembleDb(pool, writer);
 }
 
 /**
@@ -112,16 +137,22 @@ export async function createDatabase(
 export async function createMemoryDatabase(): Promise<Database> {
     const pool = createMemoryPool();
     declareSchema(pool);
-    return assembleDb(pool);
+    const writer = new MemoryTransactionalVaultWriter(pool);
+    return assembleDb(pool, writer);
 }
 
-async function assembleDb(pool: PoolLike): Promise<Database> {
+async function assembleDb(
+    pool: PoolLike,
+    vaultWriter: TransactionalVaultWriter,
+): Promise<Database> {
     return {
         pool,
         identities: new PostgresIdentityRepository(pool),
         audit: new PostgresAuditRepository(pool),
         mfa: new PostgresMfaRepository(pool),
         keyMetadata: new PostgresKeyMetadataRepository(pool),
+        tokens: new PostgresTokenRepository(pool),
+        vaultWriter,
         async close() {
             await pool.end();
         },
@@ -131,13 +162,14 @@ async function assembleDb(pool: PoolLike): Promise<Database> {
 /**
  * Hand-written TypeScript schema for the in-memory pool.
  *
- * Mirrors `src/db/migrations/001_initial_schema.sql` exactly:
+ * Mirrors the SQL migrations in `src/db/migrations/`:
  *
- *   - `vault_schema_migrations`  — bookkeeping only
- *   - `vault_identities`         — encrypted blobs
- *   - `vault_audit_log`          — append-only trail
- *   - `vault_mfa_challenges`     — step-up auth artifacts
- *   - `vault_key_metadata`       — key lifecycle
+ *   - `vault_schema_migrations`  — bookkeeping only (001)
+ *   - `vault_identities`         — encrypted blobs (001)
+ *   - `vault_audit_log`          — append-only trail (001)
+ *   - `vault_mfa_challenges`     — step-up auth artifacts (001)
+ *   - `vault_key_metadata`       — key lifecycle (001)
+ *   - `vault_tokens`             — per-tokenization envelope (002)
  *
  * The supported SQL grammar in `MemoryPool` is
  * `INSERT / UPDATE / SELECT` of the shapes the adapters issue; DDL is
@@ -220,6 +252,22 @@ function declareSchema(pool: MemoryPool): void {
             defaults: {
                 status: () => 'active',
             },
+        },
+        {
+            // Session 4 — tokenization envelope.
+            // Mirrors `migrations/002_tokens.sql`.
+            name: 'vault_tokens',
+            pk: 'id',
+            columns: [
+                { name: 'id', type: 'text', nullable: false },
+                { name: 'identity_id', type: 'text', nullable: false },
+                { name: 'algorithm', type: 'text', nullable: false },
+                { name: 'ciphertext', type: 'bytes', nullable: false },
+                { name: 'iv', type: 'bytes', nullable: false },
+                { name: 'auth_tag', type: 'bytes', nullable: false },
+                { name: 'wrapped_dek', type: 'bytes', nullable: false },
+                { name: 'created_at', type: 'date', nullable: false },
+            ],
         },
     ];
     for (const t of tables) pool.define(t);

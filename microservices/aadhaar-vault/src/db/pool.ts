@@ -30,6 +30,31 @@ export interface PoolLike {
 }
 
 /**
+ * Narrower runner contract. Both `pg.Pool` and `pg.PoolClient`
+ * (returned by `pg.Pool.connect()`) satisfy this; `MemoryPool`
+ * also satisfies it. Repository adapters take a {@link QueryRunner}
+ * rather than a {@link PoolLike} so the *same* adapter class
+ * can be invoked with either:
+ *
+ *   - a pool directly (the normal path used by `db/index.ts`); or
+ *   - a connected client bound to an in-progress transaction
+ *     (the path used by the transactional vault writer —
+ *     `src/db/adapters/postgres-transactional-vault-writer.ts`).
+ *
+ * `PoolClient` lacks `end()` (only `Pool` has it), so a
+ * `PoolLike`-typed parameter would refuse a `PoolClient`. Widening
+ * the adapters to `QueryRunner` is a structural narrowing of the
+ * API surface that the adapters actually depend on (they issue
+ * `query(...)` and nothing else).
+ */
+export interface QueryRunner {
+    query<T = unknown>(
+        text: string,
+        params?: unknown[],
+    ): Promise<{ rows: T[]; rowCount: number | null }>;
+}
+
+/**
  * Construct a real Postgres pool backed by `pg`.
  *
  * `pg` is a CommonJS module; under ESM + NodeNext it surfaces as a

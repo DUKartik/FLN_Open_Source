@@ -4,13 +4,19 @@
  * Maps between the domain shape (`IdentityRecord`) and the row shape
  * stored in `vault_identities`. BYTEA columns round-trip as `Buffer`
  * in both `pg` and `pg-mem`, so no extra serialization is required.
+ *
+ * Takes a {@link QueryRunner} (not a `PoolLike`) so the *same* adapter
+ * can be wired either to a bare `pg.Pool` or to a `pg.PoolClient`
+ * bound to an in-progress transaction owned by
+ * `PostgresTransactionalVaultWriter`. See `../pool.ts` for the
+ * rationale behind the two-tier contract.
  */
 import type {
     IdentityRecord,
     IdentityRepository,
     NewIdentityRecord,
 } from '../ports/identity.repository.js';
-import type { PoolLike } from '../pool.js';
+import type { QueryRunner } from '../pool.js';
 
 interface IdentityRow {
     identity_id: string;
@@ -37,11 +43,11 @@ function mapRow(row: IdentityRow): IdentityRecord {
 }
 
 export class PostgresIdentityRepository implements IdentityRepository {
-    constructor(private readonly pool: PoolLike) {}
+    constructor(private readonly runner: QueryRunner) {}
 
     async insert(rec: NewIdentityRecord): Promise<IdentityRecord> {
         const now = new Date();
-        const { rows } = await this.pool.query<IdentityRow>(
+        const { rows } = await this.runner.query<IdentityRow>(
             `INSERT INTO vault_identities
                 (identity_id, ciphertext, aad, pepper_version, key_version, created_at)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -61,7 +67,7 @@ export class PostgresIdentityRepository implements IdentityRepository {
     }
 
     async getById(identityId: string): Promise<IdentityRecord | null> {
-        const { rows } = await this.pool.query<IdentityRow>(
+        const { rows } = await this.runner.query<IdentityRow>(
             `SELECT identity_id, ciphertext, aad,
                     pepper_version, key_version,
                     created_at, rotated_at, revoked_at
@@ -74,7 +80,7 @@ export class PostgresIdentityRepository implements IdentityRepository {
 
     async revoke(identityId: string): Promise<void> {
         const now = new Date();
-        await this.pool.query(
+        await this.runner.query(
             `UPDATE vault_identities
              SET revoked_at = $2
              WHERE identity_id = $1 AND revoked_at IS NULL`,
@@ -84,7 +90,7 @@ export class PostgresIdentityRepository implements IdentityRepository {
 
     async rotate(identityId: string, keyVersion: number): Promise<void> {
         const now = new Date();
-        await this.pool.query(
+        await this.runner.query(
             `UPDATE vault_identities
              SET key_version = $2, rotated_at = $3
              WHERE identity_id = $1`,

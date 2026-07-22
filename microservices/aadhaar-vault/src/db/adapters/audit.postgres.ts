@@ -11,7 +11,7 @@ import type {
     AuditRecord,
     AuditRepository,
 } from '../ports/audit.repository.js';
-import type { PoolLike } from '../pool.js';
+import type { QueryRunner } from '../pool.js';
 
 interface AuditRow {
     audit_id: number;
@@ -40,14 +40,14 @@ function mapRow(row: AuditRow): AuditRecord {
 }
 
 export class PostgresAuditRepository implements AuditRepository {
-    constructor(private readonly pool: PoolLike) {}
+    constructor(private readonly runner: QueryRunner) {}
 
     async append(entry: AuditEntry): Promise<void> {
         // Application-supplied timestamp so that the same `pg-mem` test
         // harness that runs the migration also runs the repositories.
         // See the note at the top of `001_initial_schema.sql`.
         const occurredAt = new Date();
-        await this.pool.query(
+        await this.runner.query(
             `INSERT INTO vault_audit_log
                 (identity_id, actor, action, outcome, reason, request_id, occurred_at, meta)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
@@ -69,7 +69,7 @@ export class PostgresAuditRepository implements AuditRepository {
         opts?: { limit?: number },
     ): Promise<AuditRecord[]> {
         const limit = Math.max(1, Math.min(opts?.limit ?? 50, 500));
-        const { rows } = await this.pool.query<AuditRow>(
+        const { rows } = await this.runner.query<AuditRow>(
             `SELECT audit_id, identity_id, actor, action, outcome,
                     reason, request_id, occurred_at, meta
              FROM vault_audit_log

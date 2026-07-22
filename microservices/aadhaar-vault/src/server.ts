@@ -28,10 +28,16 @@ import {
 } from './db/index.js';
 import { createLogger, type Logger } from './logger.js';
 import { healthRoutes } from './routes/health.routes.js';
+import { tokenizeRoutes } from './routes/tokenize.routes.js';
 import {
   createKeyManager,
 } from './infrastructure/key-providers/index.js';
 import type { KeyManager } from './application/ports/key-manager.js';
+import type { CryptoService } from './application/ports/crypto.service.js';
+import type { EventPublisher } from './application/ports/event-publisher.js';
+import type { TransactionalVaultWriter } from './application/ports/transactional-vault-writer.js';
+import { NodeCryptoService } from './infrastructure/crypto/node-crypto.service.js';
+import { InProcessEventPublisher } from './infrastructure/events/in-process-event-publisher.js';
 
 export interface BuildServerOptions {
   config?: Config;
@@ -54,12 +60,32 @@ export interface BuildServerOptions {
    * Tests can pass a fully-built KeyManager to bypass the factory.
    */
   keyManager?: KeyManager;
+  /**
+   * Optional CryptoService override. Defaults to `NodeCryptoService`,
+   * which only uses Node's built-in `crypto` module and is safe to
+   * instantiate unconditionally.
+   */
+  crypto?: CryptoService;
+  /**
+   * Optional EventPublisher override. Defaults to the in-process
+   * adapter (a no-op aside from a debug log line) so the boot path is
+   * a single constructor. A future Redis Streams adapter lands here.
+   */
+  events?: EventPublisher;
 }
 
 declare module 'fastify' {
   interface FastifyInstance {
     db?: Database;
     keyManager?: KeyManager;
+    crypto?: CryptoService;
+    events?: EventPublisher;
+    /**
+     * Convenience reference to `db?.vaultWriter`. Set iff `db` is set.
+     * Surfaced so the route module can address it through the same
+     * `app.*` fastify-decoration seam as everything else.
+     */
+    vaultWriter?: TransactionalVaultWriter;
   }
 }
 
@@ -110,6 +136,28 @@ export async function buildServer(
     app.keyManager = createKeyManager({ config, logger });
   }
 
+  // Wire the CryptoService. NodeCryptoService is dependency-free (just
+  // uses node's built-in crypto module), so it is safe to instantiate
+  // unconditionally. A real KMS-backed CryptoService adapter would
+  // gate construction on config the same way the KeyManager does.
+  app.crypto = options.crypto ?? new NodeCryptoService();
+
+  // Wire the EventPublisher. In-process adapter is fine for v0.1 —
+  // events never leave the process. A future Redis Streams adapter
+  // swaps in here via `options.events`.
+  app.events =
+    options.events ??
+    new InProcessEventPublisher({
+      logger: { info: (obj, msg) => logger.info(obj, msg) },
+    });
+
+  // Surface the transactional vault writer for the tokenize route.
+  // The writer always travels with the Database; the alias is purely
+  // a convenience so the route can read `app.vaultWriter` instead of
+  // reaching through `app.db.vaultWriter` (and tripping nulls on a
+  // hypothetical DB-less boot).
+  app.vaultWriter = app.db?.vaultWriter;
+
   app.setErrorHandler((err, _req, reply) => {
     // Log the error with the request context. The response shape is intentionally
     // minimal — the vault never echoes internal error messages to the caller
@@ -144,6 +192,23 @@ export async function buildServer(
           return false;
         }
       },
+    },
+  });
+
+  // Register the tokenize route. It depends on every cross-cutting
+  // port having been wired onto the Fastify instance. If the DB is
+  // absent, the route will simply return 503 on the first hit rather
+  // than crashing the boot — the readiness probe already reports the
+  // DB as unreachable.
+  await app.register(tokenizeRoutes, {
+    deps: {
+      version: '0.1.0',
+      keyManager: () => app.keyManager,
+      crypto: () => app.crypto,
+      vaultWriter: () => app.vaultWriter,
+      events: () => app.events,
+      db: () => app.db,
+      logger,
     },
   });
 

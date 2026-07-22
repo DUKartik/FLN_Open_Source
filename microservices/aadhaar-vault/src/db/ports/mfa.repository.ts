@@ -1,5 +1,5 @@
 /**
- * MFA challenge repository port.
+ * MFA(Multi-Factor Authentication) challenge repository port.
  *
  * Step-up authentication is used when the caller wants to detokenize
  * (i.e. unwrap the ciphertext and obtain the plaintext identity
