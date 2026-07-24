@@ -47,6 +47,16 @@ const ConfigSchema = z.object({
   SERVICE_JWT_AUDIENCE: z.string().min(1).optional(),
   SERVICE_JWT_ISSUER: z.string().url().optional(),
   FLN_BACKEND_JWKS_URL: z.string().url().optional(),
+
+  // Session 4 (auth foundation): shared HMAC secret used by the
+  // Hs256JwtVerifier adapter. Required at boot when NODE_ENV != 'test'
+  // so a non-test deployment cannot accidentally run without auth.
+  SERVICE_JWT_HMAC_SECRET: z.string().min(1).optional(),
+  // Algorithm selector for the verifier factory. Currently only HS256
+  // is implemented; RS256/JWKS lands in a follow-up session.
+  SERVICE_JWT_ALGORITHM: z.enum(['HS256']).optional(),
+  // Allowed clock skew in seconds for JWT exp/nbf validation.
+  SERVICE_JWT_CLOCK_TOLERANCE_SECONDS: z.coerce.number().int().min(0).optional(),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -80,6 +90,18 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(
       '[aadhaar-vault] VAULT_DB_URI is required when NODE_ENV != "test". ' +
         'Set it to a postgres:// connection string.',
+    );
+  }
+
+  // Session 4 (auth foundation): refuse to boot in non-test environments
+  // without an HMAC secret. Without this guard a misconfigured production
+  // deploy would silently run with `authPlugin` doing nothing because the
+  // verifier would be constructed against an empty secret. Tests skip the
+  // guard because they wire their own deps directly into `buildServer`.
+  if (cfg.NODE_ENV !== 'test' && !cfg.SERVICE_JWT_HMAC_SECRET) {
+    throw new Error(
+      '[aadhaar-vault] SERVICE_JWT_HMAC_SECRET is required when NODE_ENV != "test". ' +
+        'Set it to a shared HS256 secret (>= 32 bytes of entropy).',
     );
   }
 

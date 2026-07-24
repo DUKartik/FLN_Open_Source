@@ -6,6 +6,10 @@
  * and the application-layer `TokenizeAadhaar` command. The route is
  * intentionally thin:
  *
+ *   - Require the `vault:tokenize` scope via the auth plugin's
+ *     `req.requireScope()` guard. The guard returns 401 when the
+ *     verifier rejected the bearer token, and 403 when the token is
+ *     valid but lacks the scope.
  *   - Parse + validate the request body with Zod. Anything malformed
  *     never reaches the command.
  *   - Stitch a `TokenizeCallerContext` from explicit fields + the live
@@ -16,11 +20,16 @@
  *
  * # Authentication boundary
  *
- * Authentication & authorization are scoped for a later session. The
- * route currently reads `actorId` / `actorRole` from the request body,
- * which is acceptable ONLY behind an auth-bearing gateway that strips
- * or overrides those fields. The TODO marker in the handler flags the
- * gap; remove it once an auth plugin lands.
+ * When the auth plugin is wired (production), the verified JWT's
+ * `subject` is the source of truth for `actorId`. The body's
+ * `actorId` is then merely advisory. This guarantees the audit row
+ * carries a verified caller identity, not a client-asserted one.
+ *
+ * In test builds, the auth plugin is a no-op (no HMAC secret) and
+ * `req.principal` is `null`. The route then falls back to the body's
+ * `actorId` so the existing route test fixture can still drive the
+ * happy path without minting a bearer token. The same code path runs
+ * in both cases; the only difference is which field wins.
  */
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
@@ -42,12 +51,12 @@ import {
 
 const IdentityTypeEnum = z.enum(['AADHAAR', 'BIRTH_CERTIFICATE']);
 
-/** Minimal actor descriptor. Auth middleware (later session) will
- *  inject this from the verified bearer token; for now it travels in
- *  the body. The enum string-set MUST mirror `TokenizeCallerContext`
- *  in `application/commands/tokenize-aadhaar.ts` exactly — a mismatch
- *  here would only be caught when the command throws on a narrower
- *  type assertion. Keep them in sync. */
+/** Minimal actor descriptor. The auth plugin's verified principal
+ *  (`req.principal.subject`) overrides the body for `actorId` when
+ *  the plugin is wired; the body value is therefore a test-only or
+ *  trust-gateway fallback. The enum string-set MUST mirror
+ *  `TokenizeCallerContext` in `application/commands/tokenize-aadhaar.ts`
+ *  exactly. */
 const ActorRoleEnum = z.enum([
   'TEACHER',
   'SCHOOL_ADMIN',
@@ -122,20 +131,20 @@ function replyForCommandError(
   // exposes the stable architectural code.
   reply.code(status).send({
     error: err.code,
-      message:
-        status >= 500
-          ? 'An unexpected error occurred.'
-          : err.code === 'INVALID_INPUT'
-            ? 'Request input did not satisfy the tokenization contract.'
-            : err.code === 'UNAUTHORIZED'
-              ? 'Missing or invalid credentials.'
-              : err.code === 'FORBIDDEN'
-                ? 'Caller is not allowed to tokenize this identity.'
-                : err.code === 'PEPPER_MISMATCH'
-                  ? 'Identity does not match the active pepper.'
-                  : err.code === 'RATE_LIMIT'
-                    ? 'Too many tokenization requests; retry later.'
-                    : 'Request could not be processed.',
+    message:
+      status >= 500
+        ? 'An unexpected error occurred.'
+        : err.code === 'INVALID_INPUT'
+          ? 'Request input did not satisfy the tokenization contract.'
+          : err.code === 'UNAUTHORIZED'
+            ? 'Missing or invalid credentials.'
+            : err.code === 'FORBIDDEN'
+              ? 'Caller is not allowed to tokenize this identity.'
+              : err.code === 'PEPPER_MISMATCH'
+                ? 'Identity does not match the active pepper.'
+                : err.code === 'RATE_LIMIT'
+                  ? 'Too many tokenization requests; retry later.'
+                  : 'Request could not be processed.',
   });
 }
 
@@ -161,6 +170,18 @@ export const tokenizeRoutes: FastifyPluginAsync<{ deps: TokenizeDeps }> = async 
   { deps },
 ) => {
   app.post('/v1/tokenize', async (req, reply) => {
+    /* ---------------- auth boundary ---------------- */
+    // `req.requireScope` is installed by the auth plugin. When the
+    // verifier is wired (production), the call is a hard gate:
+    //   - missing/invalid token  → 401 (auth plugin's onRequest hook)
+    //   - valid token, no scope  → 403 with `error: 'unauthorized'`
+    // When the verifier is NOT wired (test only — `NODE_ENV=test`
+    // without `SERVICE_JWT_HMAC_SECRET`), `requireScope` was
+    // initialised to a function that throws a 503. The route is
+    // therefore unreachable in that configuration, which is the
+    // desired fail-closed behaviour.
+    req.requireScope('vault:tokenize');
+
     /* ---------------- dependency guard ---------------- */
     const keyManager = deps.keyManager();
     const crypto = deps.crypto();
@@ -198,14 +219,14 @@ export const tokenizeRoutes: FastifyPluginAsync<{ deps: TokenizeDeps }> = async 
 
     const body: TokenizeRequest = parsed.data;
 
-    /* ---------------- auth boundary (TODO) ----------------
-     * When auth middleware lands, replace the `body.context.actorId`
-     * / `actorRole` reads with values pulled from the verified bearer
-     * token. The downstream audit row will then carry the verified
-     * caller identity rather than a client-asserted one. Until then
-     * the route MUST sit behind a trusted upstream gateway that
-     * strips these fields. */
-    const verifiedCaller = body.context;
+    /* ---------------- actor identity ----------------
+     * When the auth plugin produced a verified principal, prefer
+     * `req.principal.subject` over the client-supplied `actorId`. The
+     * body value is retained as a fallback for the test path only,
+     * where the plugin is a no-op and `req.principal` is `null`. */
+    const verifiedSubject = req.principal?.subject;
+    const actorId = verifiedSubject ?? body.context.actorId;
+    const actorRole = body.context.actorRole;
 
     const command = makeTokenizeAadhaar({
       keyManager,
@@ -220,13 +241,13 @@ export const tokenizeRoutes: FastifyPluginAsync<{ deps: TokenizeDeps }> = async 
         raw: body.raw,
         type: body.type,
         context: {
-          actorId: verifiedCaller.actorId,
-          actorRole: verifiedCaller.actorRole,
-          reason: verifiedCaller.reason,
-          requestId: verifiedCaller.requestId ?? req.id,
-          sourceIp: verifiedCaller.sourceIp ?? req.ip,
+          actorId,
+          actorRole,
+          reason: body.context.reason,
+          requestId: body.context.requestId ?? req.id,
+          sourceIp: body.context.sourceIp ?? req.ip,
           userAgent:
-            verifiedCaller.userAgent ??
+            body.context.userAgent ??
             (req.headers['user-agent'] as string | undefined),
         },
       });
@@ -236,7 +257,8 @@ export const tokenizeRoutes: FastifyPluginAsync<{ deps: TokenizeDeps }> = async 
           {
             err,
             errCode: err.code,
-            actorId: verifiedCaller.actorId,
+            actorId,
+            actorRole,
             type: body.type,
             reqId: req.id,
           },
@@ -256,15 +278,15 @@ export const tokenizeRoutes: FastifyPluginAsync<{ deps: TokenizeDeps }> = async 
     }
 
     /* ---------------- success response ---------------- */
-      reply.code(201).send({
-        token: result.token,
-        last4: result.last4,
-        tokenType: result.tokenType,
-        auditId: result.auditId,
-        identityId: result.identityId,
-        keyVersion: result.keyVersion,
-      });
-      return;
+    reply.code(201).send({
+      token: result.token,
+      last4: result.last4,
+      tokenType: result.tokenType,
+      auditId: result.auditId,
+      identityId: result.identityId,
+      keyVersion: result.keyVersion,
+    });
+    return;
   });
 };
 

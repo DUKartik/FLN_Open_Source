@@ -5,9 +5,9 @@
  *  1. Validate the request-validation contract (Zod schema).
  *     Anything malformed MUST be 400 with shape `{ error: 'invalid_request' }`
  *     so clients can branch on a stable envelope.
- *  2. Validate the happy path end-to-end (parse → command → repos → response).
- *     The route is the only path that mints a vault token, so the
- *     response envelope is part of the public contract.
+ *  2. Validate the happy path end-to-end (parse → scope check → command
+ *     → repos → response). The route is the only path that mints a vault
+ *     token, so the response envelope is part of the public contract.
  *  3. Lock the content-type discipline so future Fastify upgrades
  *     cannot silently downgrade error responses to HTML.
  *
@@ -16,6 +16,14 @@
  * is pg-mem; the deps are wired exactly the way `buildServer()` does
  * for a real deployment, so this test catches wiring regressions the
  * moment a port is unregistered or a decorator is renamed.
+ *
+ * # Auth boundary under test
+ *
+ * The auth plugin is wired with `SERVICE_JWT_HMAC_SECRET` set so the
+ * route is gated by `vault:tokenize`. The happy-path test mints a
+ * token carrying that scope; the validation-failure tests deliberately
+ * skip the scope (the route must reject the body before the scope
+ * matters, so the failure mode is still 400, not 401).
  */
 import {
   describe,
@@ -27,9 +35,14 @@ import {
 import type { FastifyInstance } from 'fastify';
 
 import { buildServer } from '../src/server.js';
+import { mintTestToken } from './helpers/mint-test-token.js';
 
 /** Pretty-typed accessor for the response body. */
 type Json = Record<string, unknown>;
+
+const TEST_HMAC_SECRET = 'a-test-hmac-secret-min-32-bytes-string-bytes';
+const TEST_ISS = 'aadhaar-vault-test';
+const TEST_AUD = 'aadhaar-vault';
 
 const TEST_CONFIG = {
   NODE_ENV: 'test',
@@ -39,7 +52,23 @@ const TEST_CONFIG = {
   KEY_PROVIDER: 'local-dev',
   LOCAL_DEV_MASTER_KEY: Buffer.alloc(32, 0x42).toString('base64'),
   KEY_VERSION: 'kv-1',
+  SERVICE_JWT_HMAC_SECRET: TEST_HMAC_SECRET,
+  SERVICE_JWT_ISSUER: TEST_ISS,
+  SERVICE_JWT_AUDIENCE: TEST_AUD,
 } as const;
+
+const TOKENIZE_TOKEN = mintTestToken({
+  secret: TEST_HMAC_SECRET,
+  subject: 'teacher-101',
+  scopes: ['vault:tokenize'],
+  issuer: TEST_ISS,
+  audience: TEST_AUD,
+});
+
+const authHeaders = (): Record<string, string> => ({
+  'content-type': 'application/json',
+  authorization: `Bearer ${TOKENIZE_TOKEN}`,
+});
 
 const happyBody = {
   raw: '123456789012',
@@ -73,7 +102,7 @@ describe('POST /v1/tokenize (route layer)', () => {
       method: 'POST',
       url: '/v1/tokenize',
       payload: {},
-      headers: { 'content-type': 'application/json' },
+      headers: authHeaders(),
     });
 
     expect(res.statusCode).toBe(400);
@@ -91,7 +120,7 @@ describe('POST /v1/tokenize (route layer)', () => {
         ...happyBody,
         context: { ...happyBody.context, actorRole: 'GOD_MODE' },
       },
-      headers: { 'content-type': 'application/json' },
+      headers: authHeaders(),
     });
 
     expect(res.statusCode).toBe(400);
@@ -103,7 +132,7 @@ describe('POST /v1/tokenize (route layer)', () => {
       method: 'POST',
       url: '/v1/tokenize',
       payload: { ...happyBody, surprise: true },
-      headers: { 'content-type': 'application/json' },
+      headers: authHeaders(),
     });
 
     expect(res.statusCode).toBe(400);
@@ -122,7 +151,7 @@ describe('POST /v1/tokenize (route layer)', () => {
         ...happyBody,
         context: { ...happyBody.context, reason: filler },
       },
-      headers: { 'content-type': 'application/json' },
+      headers: authHeaders(),
     });
 
     expect(res.statusCode).toBeGreaterThanOrEqual(400);
@@ -135,7 +164,7 @@ describe('POST /v1/tokenize (route layer)', () => {
       method: 'POST',
       url: '/v1/tokenize',
       payload: happyBody,
-      headers: { 'content-type': 'application/json' },
+      headers: authHeaders(),
     });
 
     expect(res.statusCode).toBe(201);
@@ -153,6 +182,89 @@ describe('POST /v1/tokenize (route layer)', () => {
     expect(body.keyVersion).toBe('kv-1');
   });
 
+  // ---------------- auth boundary ----------------
+
+  it('returns 401 when no bearer token is supplied', async () => {
+    const res = await app!.inject({
+      method: 'POST',
+      url: '/v1/tokenize',
+      payload: happyBody,
+      headers: { 'content-type': 'application/json' },
+    });
+
+    expect(res.statusCode).toBe(401);
+    const body = res.json() as Json;
+    expect(body.error).toBe('unauthorized');
+    expect(typeof body.message).toBe('string');
+  });
+
+  it('returns 401 when the bearer token is malformed', async () => {
+    const res = await app!.inject({
+      method: 'POST',
+      url: '/v1/tokenize',
+      payload: happyBody,
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer not-a-jwt',
+      },
+    });
+
+    expect(res.statusCode).toBe(401);
+    const body = res.json() as Json;
+    expect(body.error).toBe('unauthorized');
+    expect(body.code).toBe('token_malformed');
+  });
+
+  it('returns 401 when the bearer token is expired', async () => {
+    const expired = mintTestToken({
+      secret: TEST_HMAC_SECRET,
+      subject: 'user-1',
+      scopes: ['vault:tokenize'],
+      issuer: TEST_ISS,
+      audience: TEST_AUD,
+      expiresInSec: -60,
+    });
+    const res = await app!.inject({
+      method: 'POST',
+      url: '/v1/tokenize',
+      payload: happyBody,
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${expired}`,
+      },
+    });
+
+    expect(res.statusCode).toBe(401);
+    const body = res.json() as Json;
+    expect(body.error).toBe('unauthorized');
+    expect(body.code).toBe('token_expired');
+  });
+
+  it('returns 403 when the token lacks the required scope', async () => {
+    const wrongScopeToken = mintTestToken({
+      secret: TEST_HMAC_SECRET,
+      subject: 'user-1',
+      scopes: ['vault:read'],
+      issuer: TEST_ISS,
+      audience: TEST_AUD,
+    });
+    const res = await app!.inject({
+      method: 'POST',
+      url: '/v1/tokenize',
+      payload: happyBody,
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${wrongScopeToken}`,
+      },
+    });
+
+    expect(res.statusCode).toBe(403);
+    const body = res.json() as Json;
+    expect(body.error).toBe('forbidden');
+    expect(typeof body.message).toBe('string');
+    expect(body.message).toMatch(/scope/);
+  });
+
   // ---------------- content-type discipline ----------------
 
   it('returns JSON even on error (not HTML)', async () => {
@@ -160,7 +272,7 @@ describe('POST /v1/tokenize (route layer)', () => {
       method: 'POST',
       url: '/v1/tokenize',
       payload: {},
-      headers: { 'content-type': 'application/json' },
+      headers: authHeaders(),
     });
 
     expect(res.headers['content-type']).toMatch(/application\/json/);
@@ -181,7 +293,7 @@ describe('POST /v1/tokenize registration', () => {
         method: 'POST',
         url: '/v1/tokenize',
         payload: {},
-        headers: { 'content-type': 'application/json' },
+        headers: authHeaders(),
       });
       expect(res.statusCode).toBe(400);
     } finally {

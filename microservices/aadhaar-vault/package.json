@@ -17,6 +17,8 @@
   },
   "dependencies": {
     "fastify": "^4.28.1",
+    "fastify-plugin": "4.5.1",
+    "jose": "5.9.6",
     "pg": "^8.13.1",
     "pino": "^9.5.0",
     "pino-pretty": "^11.3.0",

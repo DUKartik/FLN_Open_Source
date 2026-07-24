@@ -8,10 +8,14 @@
  *  - Register the health routes.
  *  - Wire the Postgres pool + repositories on the Fastify instance as
  *    `app.db`. Health probes use this to ping the database.
+ *  - Wire the auth plugin (HS256 JWT verifier + scopes) when config
+ *    supplies an HMAC secret. Public routes (health) carry a route
+ *    config flag `{ public: true }` and bypass the verifier.
  *  - Wire graceful SIGINT/SIGTERM shutdown (closes both Fastify and DB).
  *
- * Session 2 wires the DB. Sessions 3–5 (crypto, auth, OpenAPI) plug in
- * the same way: an instance decorator + a graceful shutdown hook.
+ * Session 2 wires the DB. Session 3 wires the key manager. Session 4
+ * wires the auth plugin. The wiring seam is the same: an instance
+ * decorator + a register call before routes.
  */
 import Fastify, {
   type FastifyBaseLogger,
@@ -29,15 +33,16 @@ import {
 import { createLogger, type Logger } from './logger.js';
 import { healthRoutes } from './routes/health.routes.js';
 import { tokenizeRoutes } from './routes/tokenize.routes.js';
-import {
-  createKeyManager,
-} from './infrastructure/key-providers/index.js';
+import { createKeyManager } from './infrastructure/key-providers/index.js';
 import type { KeyManager } from './application/ports/key-manager.js';
 import type { CryptoService } from './application/ports/crypto.service.js';
 import type { EventPublisher } from './application/ports/event-publisher.js';
 import type { TransactionalVaultWriter } from './application/ports/transactional-vault-writer.js';
+import type { JwtVerifier } from './application/ports/jwt-verifier.js';
 import { NodeCryptoService } from './infrastructure/crypto/node-crypto.service.js';
 import { InProcessEventPublisher } from './infrastructure/events/in-process-event-publisher.js';
+import { createJwtVerifierFromConfig } from './auth/factory.js';
+import authPlugin from './auth/plugin.js';
 
 export interface BuildServerOptions {
   config?: Config;
@@ -72,6 +77,17 @@ export interface BuildServerOptions {
    * a single constructor. A future Redis Streams adapter lands here.
    */
   events?: EventPublisher;
+  /**
+   * Optional JwtVerifier override. When omitted, the server attempts to
+   * construct one via the factory (`createJwtVerifierFromConfig`). If the
+   * factory returns `undefined` (e.g. test config without
+   * `SERVICE_JWT_HMAC_SECRET`), the server boots WITHOUT an auth plugin
+   * — health probes remain public, but every other route is wired to a
+   * 503-by-default handler via the auth plugin's requireScope guard.
+   * Tests that exercise authenticated routes must pass a fully-built
+   * verifier here.
+   */
+  jwtVerifier?: JwtVerifier;
 }
 
 declare module 'fastify' {
@@ -86,6 +102,13 @@ declare module 'fastify' {
      * `app.*` fastify-decoration seam as everything else.
      */
     vaultWriter?: TransactionalVaultWriter;
+    /**
+     * Set iff a JwtVerifier was wired at boot. Used by the auth plugin
+     * to verify bearer tokens, and by individual routes to enforce
+     * scopes. When undefined the auth plugin is not registered — see
+     * `BuildServerOptions.jwtVerifier` for the rationale.
+     */
+    jwtVerifier?: JwtVerifier;
   }
 }
 
@@ -158,14 +181,69 @@ export async function buildServer(
   // hypothetical DB-less boot).
   app.vaultWriter = app.db?.vaultWriter;
 
+  // Wire the JWT verifier. Explicit override wins; otherwise the
+  // factory inspects config (algorithm + secret). If the factory
+  // returns undefined (e.g. test config without SERVICE_JWT_HMAC_SECRET),
+  // we leave `app.jwtVerifier` undefined — the auth plugin registration
+  // below then becomes a no-op. This is intentional: a unit test that
+  // boots in `NODE_ENV=test` and only exercises public health probes
+  // does not need to mint bearer tokens.
+  //
+  // Production safety: `loadConfig` already aborts boot if
+  // NODE_ENV !== 'test' && !SERVICE_JWT_HMAC_SECRET, so the factory
+  // never returns undefined in production.
+  app.jwtVerifier =
+    options.jwtVerifier ?? createJwtVerifierFromConfig(config, logger);
+
+  // Central error handler.
+  //
+  // Honours an explicit `err.statusCode` in the 400-499 range so that
+  // auth-plugin rejections (`requireScope` throws with statusCode 403)
+  // surface to the caller as 403, not as a generic 500. Anything else —
+  // a thrown TypeError, a Postgres connection failure, an unexpected
+  // null deref — is collapsed to 500 with a generic envelope. We never
+  // echo `err.message` to the client on 5xx because some messages may
+  // contain identifiers (e.g. PII scrubbing lag).
   app.setErrorHandler((err, _req, reply) => {
-    // Log the error with the request context. The response shape is intentionally
-    // minimal — the vault never echoes internal error messages to the caller
-    // because some of them may contain identifiers.
-    logger.error({ err }, 'aadhaar-vault request failed');
-    reply.code(500).send({
-      error: 'internal_error',
-      message: 'An unexpected error occurred.',
+    const rawStatus =
+      typeof (err as { statusCode?: unknown }).statusCode === 'number'
+        ? (err as { statusCode: number }).statusCode
+        : 500;
+    const status =
+      rawStatus >= 400 && rawStatus < 500 ? rawStatus : 500;
+
+    if (status >= 500) {
+      logger.error({ err }, 'aadhaar-vault request failed');
+      reply.code(500).send({
+        error: 'internal_error',
+        message: 'An unexpected error occurred.',
+      });
+      return;
+    }
+
+    // 4xx: log at info (not error), and pick a stable error envelope.
+    logger.info(
+      { err, status },
+      'aadhaar-vault request rejected with client error',
+    );
+    const envelopeError =
+      status === 401
+        ? 'unauthorized'
+        : status === 403
+          ? 'forbidden'
+          : status === 404
+            ? 'not_found'
+            : status === 409
+              ? 'conflict'
+              : status === 429
+                ? 'rate_limited'
+                : 'request_failed';
+    reply.code(status).send({
+      error: envelopeError,
+      message:
+        typeof err.message === 'string' && err.message.length > 0
+          ? err.message
+          : 'Request could not be processed.',
     });
   });
 
@@ -176,6 +254,20 @@ export async function buildServer(
       message: 'The requested resource does not exist.',
     });
   });
+
+  // Register the auth plugin first so the `onRequest` hook it installs
+  // is in place before any route runs. The plugin is a no-op when
+  // `app.jwtVerifier` is undefined (test config without HMAC secret);
+  // every authenticated route guards itself with `req.requireScope()`
+  // which throws 503 if invoked without a verifier.
+  if (app.jwtVerifier) {
+    await app.register(authPlugin, { verifier: app.jwtVerifier });
+  } else {
+    logger.warn(
+      'aadhaar-vault booting WITHOUT a JwtVerifier; authenticated routes will reject every request. ' +
+        'This is expected only when NODE_ENV=test without SERVICE_JWT_HMAC_SECRET.',
+    );
+  }
 
   await app.register(healthRoutes, {
     deps: {
