@@ -34,6 +34,7 @@ import type {
   PlainDek,
   WrapContext,
   WrappedDek,
+  WrappedSecret,
 } from '../../application/ports/key-manager.js';
 
 const ALGORITHM = 'aes-256-gcm';
@@ -174,5 +175,64 @@ export class LocalDevKeyManager implements KeyManager {
     const tag = cipher.getAuthTag();
     const bytes = Buffer.concat([iv, tag, ct]);
     return { bytes };
+  }
+
+  async sealSecret(
+    plaintext: Buffer,
+    context: WrapContext,
+  ): Promise<WrappedSecret> {
+    if (!Buffer.isBuffer(plaintext) || plaintext.length === 0) {
+      throw new Error(
+        '[aadhaar-vault] LocalDevKeyManager: sealSecret requires a non-empty Buffer.',
+      );
+    }
+    if (!Buffer.isBuffer(context)) {
+      throw new Error(
+        '[aadhaar-vault] LocalDevKeyManager: sealSecret context must be a Buffer.',
+      );
+    }
+    // Same AES-256-GCM envelope as DEK wrap. The subkey is HKDF-derived
+    // from `context`, so the same TOTP secret sealed under two different
+    // factor_ids produces two distinct wrapped blobs. The plaintext
+    // buffer is NOT mutated by `wrap`; the caller is responsible for
+    // safeZero'ing it.
+    return this.wrap(plaintext, context);
+  }
+
+  async openSecret(
+    wrapped: WrappedSecret,
+    context: WrapContext,
+  ): Promise<Buffer> {
+    if (!Buffer.isBuffer(wrapped?.bytes)) {
+      throw new Error(
+        '[aadhaar-vault] LocalDevKeyManager: wrapped.bytes must be a Buffer.',
+      );
+    }
+    if (!Buffer.isBuffer(context)) {
+      throw new Error(
+        '[aadhaar-vault] LocalDevKeyManager: openSecret context must be a Buffer.',
+      );
+    }
+    if (wrapped.bytes.length < IV_LEN + TAG_LEN + 1) {
+      throw new Error(
+        '[aadhaar-vault] LocalDevKeyManager: wrapped blob is too short.',
+      );
+    }
+    const iv = wrapped.bytes.subarray(0, IV_LEN);
+    const tag = wrapped.bytes.subarray(IV_LEN, IV_LEN + TAG_LEN);
+    const ct = wrapped.bytes.subarray(IV_LEN + TAG_LEN);
+    const key = this.deriveSubkey(context);
+
+    let plaintext: Buffer;
+    try {
+      const decipher = createDecipheriv(ALGORITHM, key, iv);
+      decipher.setAuthTag(tag);
+      plaintext = Buffer.concat([decipher.update(ct), decipher.final()]);
+    } catch (err) {
+      throw new Error(
+        `[aadhaar-vault] LocalDevKeyManager: openSecret integrity failure: ${(err as Error).message}`,
+      );
+    }
+    return plaintext;
   }
 }

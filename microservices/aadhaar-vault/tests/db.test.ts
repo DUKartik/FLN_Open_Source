@@ -3,7 +3,7 @@
  *
  * Uses the hand-rolled `MemoryPool` (`src/db/memory-pool.ts`) so we
  * don't need a live Postgres for unit tests. The supported SQL
- * grammar is exactly the shapes the four adapters issue; the goal is
+ * grammar is exactly the shapes the five adapters issue; the goal is
  * to verify the *adapters*, not to verify Postgres — production runs
  * against the real DB.
  */
@@ -138,40 +138,94 @@ describe('audit repository', () => {
   });
 });
 
-describe('mfa repository', () => {
-  it('inserts a pending challenge and transitions to consumed', async () => {
-    const created = await db.mfa.insert({
-      challengeId: 'chal-1',
+describe('mfa factor repository', () => {
+  it('inserts a factor, fetches it, and transitions through used / revoked', async () => {
+    const inserted = await db.mfa.insert({
+      factorId: 'factor-1',
       actor: 'fln-backend',
-      challengeType: 'totp',
-      expiresAt: new Date(Date.now() + 60_000),
+      factorType: 'totp',
+      label: 'Primary phone',
+      encryptedSecret: Buffer.from([1, 2, 3, 4]),
+      algorithm: 'SHA1',
+      digits: 6,
+      period: 30,
     });
 
-    expect(created.status).toBe('pending');
-    expect(created.consumedAt).toBeNull();
+    expect(inserted.factorId).toBe('factor-1');
+    expect(inserted.status).toBe('active');
+    expect(inserted.label).toBe('Primary phone');
+    expect(inserted.encryptedSecret.equals(Buffer.from([1, 2, 3, 4]))).toBe(
+      true,
+    );
+    expect(inserted.algorithm).toBe('SHA1');
+    expect(inserted.digits).toBe(6);
+    expect(inserted.period).toBe(30);
+    expect(inserted.lastUsedAt).toBeNull();
+    expect(inserted.expiresAt).toBeNull();
+    expect(inserted.createdAt).toBeInstanceOf(Date);
 
-    const consumed = await db.mfa.markStatus('chal-1', 'consumed');
-    expect(consumed?.status).toBe('consumed');
-    expect(consumed?.consumedAt).toBeInstanceOf(Date);
-  });
+    const used = await db.mfa.markUsed('factor-1', new Date());
+    expect(used?.status).toBe('active');
+    expect(used?.lastUsedAt).toBeInstanceOf(Date);
 
-  it('returns null when transitioning an unknown challenge', async () => {
-    const result = await db.mfa.markStatus('does-not-exist', 'failed');
-    expect(result).toBeNull();
-  });
-
-  it('fetches by id', async () => {
-    const created = await db.mfa.insert({
-      challengeId: 'chal-2',
-      actor: 'fln-backend',
-      challengeType: 'email-otp',
-      expiresAt: new Date(Date.now() + 60_000),
-    });
-    const fetched = await db.mfa.getById('chal-2');
-    expect(fetched?.challengeType).toBe('email-otp');
+    const fetched = await db.mfa.getById('factor-1');
     expect(fetched?.actor).toBe('fln-backend');
-    // sanity: created == fetched (ignoring identity)
-    expect(fetched?.challengeId).toBe(created.challengeId);
+    expect(fetched?.factorType).toBe('totp');
+  });
+
+  it('revokes a factor and removes it from listActiveByActor', async () => {
+    await db.mfa.insert({
+      factorId: 'factor-2',
+      actor: 'fln-backend',
+      factorType: 'totp',
+      label: 'Backup phone',
+      encryptedSecret: Buffer.from([9, 9, 9]),
+      algorithm: 'SHA1',
+      digits: 6,
+      period: 30,
+    });
+
+    const revoked = await db.mfa.revoke('factor-2');
+    expect(revoked?.status).toBe('revoked');
+
+    const active = await db.mfa.listActiveByActor('fln-backend');
+    expect(active).toHaveLength(0);
+
+    // Idempotent: revoking again still returns the row.
+    const again = await db.mfa.revoke('factor-2');
+    expect(again?.status).toBe('revoked');
+  });
+
+  it('listByActor returns all factors newest-first', async () => {
+    await db.mfa.insert({
+      factorId: 'factor-a',
+      actor: 'user-1',
+      factorType: 'totp',
+      label: 'A',
+      encryptedSecret: Buffer.from([1]),
+      algorithm: 'SHA1',
+      digits: 6,
+      period: 30,
+    });
+    await db.mfa.insert({
+      factorId: 'factor-b',
+      actor: 'user-1',
+      factorType: 'totp',
+      label: 'B',
+      encryptedSecret: Buffer.from([2]),
+      algorithm: 'SHA1',
+      digits: 6,
+      period: 30,
+    });
+
+    const all = await db.mfa.listByActor('user-1');
+    expect(all.map((f) => f.factorId)).toEqual(['factor-b', 'factor-a']);
+  });
+
+  it('returns null for an unknown factor id', async () => {
+    expect(await db.mfa.getById('does-not-exist')).toBeNull();
+    expect(await db.mfa.markUsed('does-not-exist', new Date())).toBeNull();
+    expect(await db.mfa.revoke('does-not-exist')).toBeNull();
   });
 });
 

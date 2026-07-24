@@ -39,8 +39,10 @@ import type { CryptoService } from './application/ports/crypto.service.js';
 import type { EventPublisher } from './application/ports/event-publisher.js';
 import type { TransactionalVaultWriter } from './application/ports/transactional-vault-writer.js';
 import type { JwtVerifier } from './application/ports/jwt-verifier.js';
+import type { TotpVerifier } from './application/ports/totp-verifier.js';
 import { NodeCryptoService } from './infrastructure/crypto/node-crypto.service.js';
 import { InProcessEventPublisher } from './infrastructure/events/in-process-event-publisher.js';
+import { OtpAuthTotpVerifier } from './infrastructure/mfa/totp-verifier.js';
 import { createJwtVerifierFromConfig } from './auth/factory.js';
 import authPlugin from './auth/plugin.js';
 
@@ -88,6 +90,13 @@ export interface BuildServerOptions {
    * verifier here.
    */
   jwtVerifier?: JwtVerifier;
+  /**
+   * Optional TotpVerifier override. When omitted, the server instantiates
+   * {@link OtpAuthTotpVerifier} unconditionally — it has no required
+   * configuration and is safe to wire on every boot. Tests can pass a
+   * stub here to assert against specific clock values.
+   */
+  totpVerifier?: TotpVerifier;
 }
 
 declare module 'fastify' {
@@ -109,6 +118,13 @@ declare module 'fastify' {
      * `BuildServerOptions.jwtVerifier` for the rationale.
      */
     jwtVerifier?: JwtVerifier;
+    /**
+     * Always set after boot. Wired by `buildServer` (override-able for
+     * tests). Routes that need TOTP enrollment / verification read this
+     * from the Fastify instance the same way they read every other
+     * cross-cutting port.
+     */
+    totpVerifier?: TotpVerifier;
   }
 }
 
@@ -194,6 +210,12 @@ export async function buildServer(
   // never returns undefined in production.
   app.jwtVerifier =
     options.jwtVerifier ?? createJwtVerifierFromConfig(config, logger);
+
+  // Wire the TOTP verifier. OtpAuthTotpVerifier has no required
+  // configuration (it constructs its own CSPRNG secrets) so the default
+  // boot path is unconditional. Tests pass a stub via `totpVerifier` to
+  // assert against fixed clock values without monkey-patching Date.now.
+  app.totpVerifier = options.totpVerifier ?? new OtpAuthTotpVerifier();
 
   // Central error handler.
   //

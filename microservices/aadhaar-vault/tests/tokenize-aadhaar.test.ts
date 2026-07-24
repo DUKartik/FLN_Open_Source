@@ -130,6 +130,12 @@ function makeFakeKeyManager(captured: { dek?: Buffer }): KeyManager {
         async wrapDataKey() {
             throw new Error('not used in v0.1 tokenize');
         },
+        async sealSecret() {
+            throw new Error('not used in v0.1 tokenize');
+        },
+        async openSecret() {
+            throw new Error('not used in v0.1 tokenize');
+        },
     };
 }
 

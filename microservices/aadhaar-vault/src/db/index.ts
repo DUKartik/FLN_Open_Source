@@ -36,6 +36,9 @@
 import type { FastifyBaseLogger } from 'fastify';
 
 import type {
+    MfaFactorRepository,
+} from '../application/ports/mfa-repository.js';
+import type {
     TransactionalVaultWriter,
 } from '../application/ports/transactional-vault-writer.js';
 import {
@@ -48,9 +51,6 @@ import {
     PostgresKeyMetadataRepository,
 } from './adapters/key-metadata.postgres.js';
 import {
-    PostgresMfaRepository,
-} from './adapters/mfa.postgres.js';
-import {
     PostgresTokenRepository,
 } from './adapters/token.postgres.js';
 import {
@@ -59,12 +59,14 @@ import {
 import {
     PostgresTransactionalVaultWriter,
 } from './adapters/postgres-transactional-vault-writer.js';
+import {
+    PostgresMfaFactorRepository,
+} from '../infrastructure/db/postgres-mfa-repository.js';
 import { MemoryPool, type TableSpec } from './memory-pool.js';
 import { runMigrations } from './migrator.js';
 import type { AuditRepository } from './ports/audit.repository.js';
 import type { IdentityRepository } from './ports/identity.repository.js';
 import type { KeyMetadataRepository } from './ports/key-metadata.repository.js';
-import type { MfaRepository } from './ports/mfa.repository.js';
 import type { TokenRepository } from './ports/token.repository.js';
 import {
     createMemoryPool,
@@ -79,7 +81,7 @@ export interface Database {
     pool: PoolLike;
     identities: IdentityRepository;
     audit: AuditRepository;
-    mfa: MfaRepository;
+    mfa: MfaFactorRepository;
     keyMetadata: KeyMetadataRepository;
     tokens: TokenRepository;
     /**
@@ -149,7 +151,7 @@ async function assembleDb(
         pool,
         identities: new PostgresIdentityRepository(pool),
         audit: new PostgresAuditRepository(pool),
-        mfa: new PostgresMfaRepository(pool),
+        mfa: new PostgresMfaFactorRepository(pool),
         keyMetadata: new PostgresKeyMetadataRepository(pool),
         tokens: new PostgresTokenRepository(pool),
         vaultWriter,
@@ -167,7 +169,7 @@ async function assembleDb(
  *   - `vault_schema_migrations`  — bookkeeping only (001)
  *   - `vault_identities`         — encrypted blobs (001)
  *   - `vault_audit_log`          — append-only trail (001)
- *   - `vault_mfa_challenges`     — step-up auth artifacts (001)
+ *   - `vault_mfa_factors`        — MFA factors (001 + 003)
  *   - `vault_key_metadata`       — key lifecycle (001)
  *   - `vault_tokens`             — per-tokenization envelope (002)
  *
@@ -217,23 +219,24 @@ function declareSchema(pool: MemoryPool): void {
             autoIncrement: true,
         },
         {
-            name: 'vault_mfa_challenges',
-            pk: 'challenge_id',
+            // Session 5 Phase 2 — renamed from vault_mfa_challenges and
+            // grown with TOTP-shaped columns. Mirrors `003_*.sql`.
+            name: 'vault_mfa_factors',
+            pk: 'factor_id',
             columns: [
-                { name: 'challenge_id', type: 'text', nullable: false },
+                { name: 'factor_id', type: 'text', nullable: false },
                 { name: 'actor', type: 'text', nullable: false },
-                { name: 'challenge_type', type: 'text', nullable: false },
+                { name: 'factor_type', type: 'text', nullable: false },
                 { name: 'status', type: 'text', nullable: false },
-                { name: 'expires_at', type: 'date', nullable: false },
-                { name: 'consumed_at', type: 'date', nullable: true },
+                { name: 'label', type: 'text', nullable: false },
+                { name: 'encrypted_secret', type: 'bytes', nullable: false },
+                { name: 'algorithm', type: 'text', nullable: false },
+                { name: 'digits', type: 'int', nullable: false },
+                { name: 'period', type: 'int', nullable: false },
+                { name: 'last_used_at', type: 'date', nullable: true },
+                { name: 'expires_at', type: 'date', nullable: true },
                 { name: 'created_at', type: 'date', nullable: false },
             ],
-            // `DEFAULT 'pending'` in 001_initial_schema.sql + an
-            // application-supplied `created_at` (the adapter always
-            // passes it; see `mfa.postgres.ts`).
-            defaults: {
-                status: () => 'pending',
-            },
         },
         {
             name: 'vault_key_metadata',
