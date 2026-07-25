@@ -35,6 +35,7 @@ import { healthRoutes } from './routes/health.routes.js';
 import { tokenizeRoutes } from './routes/tokenize.routes.js';
 import { detokenizeRoutes } from './routes/detokenize.routes.js';
 import { auditRoutes } from './routes/audit.routes.js';
+import { mfaRoutes } from './routes/mfa.routes.js';
 
 import { createKeyManager } from './infrastructure/key-providers/index.js';
 import type { KeyManager } from './application/ports/key-manager.js';
@@ -354,6 +355,23 @@ export async function buildServer(
     },
   });
 
+  // Register the MFA-enroll route. Depends on the key manager (to
+  // seal the TOTP shared secret), the TOTP verifier (to mint a
+  // fresh secret + otpauth URI), the MFA repository (to persist
+  // the factor), the audit repository (to append the enrollment
+  // row), and the event publisher (to broadcast `MfaEnrolled`).
+  // The route is gated by the `vault:mfa:enroll` JWT scope; the
+  // principal is the JWT subject.
+  await app.register(mfaRoutes, {
+    deps: {
+      version: '0.1.0',
+      keyManager: () => app.keyManager,
+      totp: () => app.totpVerifier,
+      db: () => app.db,
+      events: () => app.events,
+      logger,
+    },
+  });
 
   // On close, drain the DB pool too. We only close pools that this
   // builder created — if the caller passed their own db, they're
