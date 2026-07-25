@@ -34,6 +34,7 @@ import { createLogger, type Logger } from './logger.js';
 import { healthRoutes } from './routes/health.routes.js';
 import { tokenizeRoutes } from './routes/tokenize.routes.js';
 import { detokenizeRoutes } from './routes/detokenize.routes.js';
+import { auditRoutes } from './routes/audit.routes.js';
 
 import { createKeyManager } from './infrastructure/key-providers/index.js';
 import type { KeyManager } from './application/ports/key-manager.js';
@@ -336,6 +337,18 @@ export async function buildServer(
       keyManager: () => app.keyManager,
       crypto: () => app.crypto,
       events: () => app.events,
+      db: () => app.db,
+      logger,
+    },
+  });
+
+  // Register the audit history route. Read-only: depends on the
+  // `db.audit` port and a logger; no key manager, no crypto, no
+  // vault writer, no event publisher. The route is gated by the
+  // `vault:audit` JWT scope; the principal is the JWT subject.
+  await app.register(auditRoutes, {
+    deps: {
+      version: '0.1.0',
       db: () => app.db,
       logger,
     },
