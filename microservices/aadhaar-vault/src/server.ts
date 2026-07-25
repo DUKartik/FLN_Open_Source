@@ -33,6 +33,8 @@ import {
 import { createLogger, type Logger } from './logger.js';
 import { healthRoutes } from './routes/health.routes.js';
 import { tokenizeRoutes } from './routes/tokenize.routes.js';
+import { detokenizeRoutes } from './routes/detokenize.routes.js';
+
 import { createKeyManager } from './infrastructure/key-providers/index.js';
 import type { KeyManager } from './application/ports/key-manager.js';
 import type { CryptoService } from './application/ports/crypto.service.js';
@@ -325,6 +327,20 @@ export async function buildServer(
       logger,
     },
   });
+  // Register the detokenize route. Same dependency shape as the
+  // tokenize route, but the route does not need the vault writer
+  // (detokenize is a read + audit-append, not a multi-row write).
+  await app.register(detokenizeRoutes, {
+    deps: {
+      version: '0.1.0',
+      keyManager: () => app.keyManager,
+      crypto: () => app.crypto,
+      events: () => app.events,
+      db: () => app.db,
+      logger,
+    },
+  });
+
 
   // On close, drain the DB pool too. We only close pools that this
   // builder created — if the caller passed their own db, they're
