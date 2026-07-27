@@ -11,6 +11,12 @@
  *     // Public route (no token required):
  *     app.get('/health', { config: { public: true } }, handler);
  *
+ *     // Or, opt a URL prefix out of auth centrally:
+ *     await app.register(authPlugin, {
+ *       verifier,
+ *       publicUrlPrefixes: ['/console/'],
+ *     });
+ *
  *     // Authenticated route:
  *     app.post('/v1/tokenize', async (req) => {
  *       const { subject, scopes } = req.principal!;
@@ -29,6 +35,15 @@ import "./types.js"; // augment FastifyRequest / FastifyContextConfig
 export interface AuthPluginOptions {
   /** The verifier to use for all incoming requests. */
   readonly verifier: JwtVerifier;
+  /**
+   * URL prefixes that bypass authentication in addition to per-route
+   * `config.public = true`. Useful when a third-party plugin (e.g.
+   * `@fastify/static`) registers many routes at once and we don't have
+   * per-route config knobs available. Match is a simple `startsWith` on
+   * `request.url`; keep prefixes narrow to avoid accidentally exposing
+   * authenticated endpoints.
+   */
+  readonly publicUrlPrefixes?: ReadonlyArray<string>;
 }
 
 /** Pull the raw token from a request, or `null` if absent. */
@@ -62,7 +77,11 @@ const authPlugin: FastifyPluginAsync<AuthPluginOptions> = async (app, opts) => {
   });
 
   app.addHook("onRequest", async (req, reply) => {
-    const isPublic = req.routeOptions.config?.public === true;
+    const perRoutePublic = req.routeOptions.config?.public === true;
+    const prefixPublic = (opts.publicUrlPrefixes ?? []).some((prefix) =>
+      req.url.startsWith(prefix),
+    );
+    const isPublic = perRoutePublic || prefixPublic;
     if (isPublic) {
       // Public routes get an explicit `null` principal so handlers don't
       // accidentally treat them as authenticated.

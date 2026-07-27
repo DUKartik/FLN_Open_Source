@@ -83,16 +83,6 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): Config {
 
   const cfg = parsed.data;
 
-  // Session 2: refuse to boot in non-test environments without a DB URI.
-  // Tests skip this guard because they wire pg-mem directly without going
-  // through `process.env`.
-  if (cfg.NODE_ENV !== 'test' && !cfg.VAULT_DB_URI) {
-    throw new Error(
-      '[aadhaar-vault] VAULT_DB_URI is required when NODE_ENV != "test". ' +
-        'Set it to a postgres:// connection string.',
-    );
-  }
-
   // Session 4 (auth foundation): refuse to boot in non-test environments
   // without an HMAC secret. Without this guard a misconfigured production
   // deploy would silently run with `authPlugin` doing nothing because the

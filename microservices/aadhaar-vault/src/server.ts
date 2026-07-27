@@ -22,6 +22,10 @@ import Fastify, {
   type FastifyInstance,
   type RawServerDefault,
 } from 'fastify';
+import fastifyStatic from '@fastify/static';
+import { existsSync } from 'node:fs';
+import { dirname, resolve as resolvePath } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { loadConfig, type Config } from './config.js';
 import {
@@ -281,13 +285,75 @@ export async function buildServer(
     });
   });
 
+  // Register the static-file plugin for the developer console (`console/`).
+  //
+  // The console lives at `console/index.html` on disk and is served under
+  // `/console/...` so that it shares the same origin as the JSON API.
+  // Same-origin is the contract: the console's `fetch()` calls go to
+  // `/health`, `/v1/tokenize`, etc. on the SAME host, which means no
+  // CORS preflight, no `Access-Control-Allow-Origin` configuration, and no
+  // browser-level "blocked by CORS policy" errors. Relative URLs work in
+  // every tab without per-environment configuration.
+  //
+  // We only mount the plugin if the `console/` directory actually exists
+  // next to the compiled server (e.g. inside the Docker image we COPY it
+  // explicitly). Missing console = no static plugin; requests to
+  // `/console/` fall through to the JSON 404 above. This keeps a slim
+  // production image viable while still letting the dev workflow do
+  // `tsx watch` from a single checkout.
+  //
+  // `root` is resolved from this file's directory so it works under both
+  // `tsx src/server.ts` (dev) and `node dist/server.js` (built output,
+  // where `__dirname/dist/..` lands on the project root).
+  const here = dirname(fileURLToPath(import.meta.url));
+  const consoleDir = resolvePath(here, '..', 'console');
+  if (existsSync(consoleDir)) {
+    await app.register(fastifyStatic, {
+      root: consoleDir,
+      prefix: '/console/',
+      // Browsers should never cache: the console is dev-only. A real
+      // production deployment should leave this at the default.
+      cacheControl: false,
+      // Hide dotfiles. The console is a hand-curated directory; we never
+      // want `.env`, `.git`, etc. reachable.
+      dotfiles: 'deny',
+      // Disable directory listing. The console has its own index.html.
+      list: false,
+      // Index file lookup is on by default; explicitly request it for
+      // `/console/` → `/console/index.html`.
+      index: ['index.html'],
+      // No content negotiation: this is not an API.
+      constraints: {},
+    });
+    logger.info(
+      { consoleDir },
+      'aadhaar-vault console served from /console/ (same-origin)',
+    );
+  } else {
+    logger.warn(
+      { consoleDir },
+      'aadhaar-vault console directory not found; /console/ routes will return 404. ' +
+        'This is expected only when the console/ tree has been pruned from the deploy artefact.',
+    );
+  }
+
   // Register the auth plugin first so the `onRequest` hook it installs
   // is in place before any route runs. The plugin is a no-op when
   // `app.jwtVerifier` is undefined (test config without HMAC secret);
   // every authenticated route guards itself with `req.requireScope()`
   // which throws 503 if invoked without a verifier.
   if (app.jwtVerifier) {
-    await app.register(authPlugin, { verifier: app.jwtVerifier });
+    await app.register(authPlugin, {
+      verifier: app.jwtVerifier,
+      // The /console/* routes are served same-origin from this same process
+      // via @fastify/static (see below). They must be reachable without a
+      // JWT so the browser's <script src="/console/app.js"> load works;
+      // the auth plugin's onRequest hook checks this prefix and skips
+      // auth for it. Keeping the prefix in server.ts (not hard-coded in
+      // the auth plugin) means the auth module stays unaware of the
+      // console's URL and the prefix stays a single source of truth.
+      publicUrlPrefixes: ['/console/'],
+    });
   } else {
     logger.warn(
       'aadhaar-vault booting WITHOUT a JwtVerifier; authenticated routes will reject every request. ' +
@@ -423,8 +489,10 @@ async function main(): Promise<void> {
 }
 
 // Run only when executed directly, not when imported by tests.
+// Compare decoded paths (handles spaces and other percent-encoded chars
+// in the working directory, e.g. `d:\phase2_ FLN\...`).
 const isEntrypoint =
-  import.meta.url === `file:///${process.argv[1]?.replace(/\\/g, '/')}`;
+  !!process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isEntrypoint) {
   void main();
 }

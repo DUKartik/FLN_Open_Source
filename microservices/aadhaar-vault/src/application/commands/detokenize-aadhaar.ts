@@ -186,11 +186,14 @@ export class DetokenizeCommandError extends Error {
  * change: update this helper to match the new `TokenizeAadhaar`
  * context derivation.
  */
+// CANONICAL wrap context: must match tokenize exactly. Determined only
+// from identityId (a stable row-level foreign key) so any caller with
+// the right scope can unwrap. See the matching comment in
+// `tokenize-aadhaar.ts`.
 function makeDetokenizeWrapContext(
-    tokenId: string,
     identityId: string,
 ): Buffer {
-    return Buffer.from(`detokenize:${tokenId}:${identityId}`, 'utf8');
+    return Buffer.from(`wrap:${identityId}`, 'utf8');
 }
 
 // ---------------------------------------------------------------------------
@@ -306,10 +309,7 @@ export function makeDetokenizeAadhaar(deps: DetokenizeAadhaarDeps) {
         //    `TokenizeAadhaar`'s posture for `tokenAad`).
         // -----------------------------------------------------------------
         const now = clock();
-        const wrapContext = makeDetokenizeWrapContext(
-            tokenRow.id,
-            tokenRow.identityId,
-        );
+        const wrapContext = makeDetokenizeWrapContext(tokenRow.identityId);
 
         // Caller-side correlation id echoed in the response. The
         // vault's append-only audit row id is stamped server-side

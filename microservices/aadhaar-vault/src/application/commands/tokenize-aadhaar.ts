@@ -345,11 +345,14 @@ export function makeTokenizeAadhaar(deps: TokenizeAadhaarDeps) {
         //    wrapped. See the file-level comment for why this is
         //    sensitive even though the values are otherwise known.
         // -----------------------------------------------------------------
+        // CANONICAL wrap context: depends ONLY on identityId (a stable
+        // row-level foreign key). Detokenize regenerates the same buffer
+        // before unwrapping the DEK. This makes the wrap-context
+        // deterministic w.r.t. the row, so any caller can detokenize
+        // without needing to remember which actor originally minted
+        // the token — the wrap is bound to identity, not to actor.
         const digitsBuf = Buffer.from(digits, 'utf8');
-        const wrapContext = Buffer.from(
-            `tokenize:${cmd.context.actorId}:${identityId}`,
-            'utf8',
-        );
+        const wrapContext = Buffer.from(`wrap:${identityId}`, 'utf8');
 
         // Mint a token id up-front so the audit row + event can both
         // reference it without re-deriving. (v0.1: Node's

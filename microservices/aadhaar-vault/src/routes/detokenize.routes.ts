@@ -45,16 +45,15 @@
  *   current deps from the server-owned getters; this keeps the
  *   command heap-isolated and matches the tokenize-route pattern.
  *
- * # Schema reconciliation notes
+ * # Schema reconciliation notes (RESOLVED)
  *
- *   The `DetokenizeAadhaar` command reconstructs the wrap context
- *   from `detokenize:<tokenId>:<identityId>`. This is *not* the
- *   context `TokenizeAadhaar` used to wrap the DEK. The local-dev
- *   HKDF-binding means a real tokenize → detokenize round-trip
- *   against the current schema cannot succeed; this is the
- *   documented reconciliation point and is intentionally deferred.
- *   The route still exercises the command plus the DB, plus the
- *   auth boundary, so all the wiring around the command is tested.
+ *   Both `TokenizeAadhaar` and `DetokenizeAadhaar` derive the wrap
+ *   context from `wrap:<identityId>`. The local-dev HKDF binding
+ *   therefore matches, and a tokenize → detokenize round-trip
+ *   decrypts the plaintext back to the original input. The route
+ *   still exercises the command plus the DB plus the auth boundary
+ *   end-to-end; `tests/live-roundtrip.test.ts` covers the same flow
+ *   against the bundled Postgres container.
  */
 import type { FastifyInstance, FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
