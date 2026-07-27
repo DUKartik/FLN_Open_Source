@@ -83,6 +83,10 @@ import {
     EnrollMfaCommandError,
     makeEnrollMfa,
 } from '../application/commands/enroll-mfa.js';
+import {
+    VerifyMfaCommandError,
+    makeVerifyMfa,
+} from '../application/commands/verify-mfa.js';
 import type { AuditRepository } from '../db/ports/audit.repository.js';
 import type { Database } from '../db/index.js';
 import type { EventPublisher } from '../application/ports/event-publisher.js';
@@ -172,6 +176,134 @@ function replyForCommandError(
         message:
             ERROR_MESSAGES[err.code] ?? 'An unexpected error occurred.',
     });
+}
+
+// ---------------------------------------------------------------------------
+// VerifyMfa route additions (Session 6D)
+//
+// The VerifyMfa command has a richer error vocabulary than EnrollMfa — it
+// throws `INVALID_INPUT`, `FACTOR_NOT_FOUND`, `ACTOR_MISMATCH`,
+// `CODE_MISMATCH`, `CODE_REPLAYED`, `EXPIRED`. Per the Session 6D error-
+// mapping rule, every failure-status maps to 401 (the caller is not
+// authenticated as the factor's actor). `INVALID_INPUT` is the only
+// caller-fault code and stays at 400.
+// ---------------------------------------------------------------------------
+const VerifyMfaContextSchema = z
+    .object({
+        actorRole: ActorRoleEnum,
+        reason: z.string().min(10).max(512),
+        requestId: z.string().min(1).max(128).optional(),
+        sourceIp: z.string().max(64).optional(),
+        userAgent: z.string().max(512).optional(),
+    })
+    .strict();
+
+/**
+ * `factorId` is opaque; the verifier matches by exact equality. `code`
+ * is the 6-digit TOTP the caller typed (numeric strings of the length
+ * the factor was enrolled with). `window` lets the caller widen the
+ * matching window; the application defaults to its own constant if
+ * omitted.
+ */
+const VerifyMfaRequestSchema = z
+    .object({
+        factorId: z.string().min(1).max(128),
+        code: z.string().regex(/^[0-9]{6,10}$/),
+        window: z.number().int().min(0).max(5).optional(),
+        context: VerifyMfaContextSchema,
+    })
+    .strict();
+
+/**
+ * Status mapping for {@link VerifyMfaCommandError} codes. Only
+ * `INVALID_INPUT` is currently thrown — verification failures are
+ * returned as `{valid:false}` results, not exceptions (see
+ * {@link VERIFY_FAILURE_STATUS}).
+ */
+const VERIFY_ERROR_STATUS: Record<string, number> = {
+    INVALID_INPUT: 400,
+};
+
+/**
+ * Stable, non-leaky human-readable messages keyed by thrown error
+ * code. We never echo the underlying error's `.message` to the
+ * client — it has been logged with the full detail.
+ */
+const VERIFY_ERROR_MESSAGES: Record<string, string> = {
+    INVALID_INPUT:
+        'Request input did not satisfy the MFA-verification contract.',
+};
+
+/**
+ * Status mapping for `VerifyMfaResult.valid === false` reason
+ * tags. Per the Session 6D approval (Option A), every reason
+ * collapses to 401 — an attacker must not be able to probe which
+ * factor ids exist by distinguishing 404 (no row) from 401 (wrong
+ * code). 401 is therefore the deliberately uniform answer to
+ * *every* failed verification.
+ */
+const VERIFY_FAILURE_STATUS: Record<string, number> = {
+    FACTOR_NOT_FOUND: 401,
+    FACTOR_REVOKED: 401,
+    FACTOR_EXPIRED: 401,
+    ACTOR_MISMATCH: 401,
+    CODE_MISMATCH: 401,
+};
+
+/**
+ * Stable, non-leaky human-readable messages keyed by failure
+ * reason tag.
+ */
+const VERIFY_FAILURE_MESSAGES: Record<string, string> = {
+    FACTOR_NOT_FOUND:
+        'MFA factor not recognized for this principal.',
+    FACTOR_REVOKED: 'MFA factor is no longer active.',
+    FACTOR_EXPIRED: 'MFA factor has expired.',
+    ACTOR_MISMATCH:
+        'Caller is not authorized to verify this MFA factor.',
+    CODE_MISMATCH: 'Verification code did not match.',
+};
+
+function replyForVerifyCommandError(
+    reply: FastifyReply,
+    err: VerifyMfaCommandError,
+): void {
+    const status = VERIFY_ERROR_STATUS[err.code] ?? 500;
+    reply.code(status).send({
+        error: err.code,
+        message:
+            VERIFY_ERROR_MESSAGES[err.code] ?? 'An unexpected error occurred.',
+    });
+}
+
+/**
+ * Project a `MfaFactor` for the verify response.
+ *
+ * Deliberately omits `encryptedSecret`: a verification result never
+ * needs to echo the sealed TOTP secret back to the caller. The
+ * remaining fields are identical to {@link projectFactor} so the
+ * client sees a consistent shape across enroll and verify.
+ */
+function projectFactorForVerify(
+    factor: import('../application/ports/mfa-repository.js').MfaFactor,
+): Record<string, unknown> {
+    return {
+        factorId: factor.factorId,
+        actor: factor.actor,
+        factorType: factor.factorType,
+        status: factor.status,
+        label: factor.label,
+        algorithm: factor.algorithm,
+        digits: factor.digits,
+        period: factor.period,
+        lastUsedAt: factor.lastUsedAt
+            ? factor.lastUsedAt.toISOString()
+            : null,
+        expiresAt: factor.expiresAt
+            ? factor.expiresAt.toISOString()
+            : null,
+        createdAt: factor.createdAt.toISOString(),
+    };
 }
 
 export interface EnrollMfaDeps {
@@ -356,6 +488,182 @@ export const mfaRoutes: FastifyPluginAsync<{ deps: EnrollMfaDeps }> =
                 deps.logger.error(
                     { err, reqId: req.id },
                     'aadhaar-vault mfa-enroll unexpected error',
+                );
+                throw err;
+            }
+        });
+
+        // ---------------------------------------------------------------
+        // POST /v1/mfa/verify — Session 6D
+        //
+        // Step-up authentication: the caller proves control of a TOTP
+        // factor already enrolled for their principal. The route is a
+        // thin adapter over the application-layer `VerifyMfa` command.
+        // ---------------------------------------------------------------
+        app.post('/v1/mfa/verify', async (req, reply) => {
+            // -------------------------------------------------------------
+            // 1. Auth boundary. Distinct scope from enroll so a token
+            //    allowed to enroll a factor cannot be used to verify
+            //    one belonging to a different principal.
+            // -------------------------------------------------------------
+            req.requireScope('vault:mfa:verify');
+
+            // -------------------------------------------------------------
+            // 2. Lazy dep resolution. The command needs KeyManager +
+            //    TotpVerifier + MfaFactorRepository + AuditRepository
+            //    + EventPublisher.
+            // -------------------------------------------------------------
+            const keyManager = deps.keyManager();
+            const totp = deps.totp();
+            const db = deps.db();
+            const events = deps.events();
+
+            if (!keyManager || !totp || !db || !events) {
+                deps.logger.error(
+                    { route: 'POST /v1/mfa/verify' },
+                    'aadhaar-vault mfa-verify route invoked with missing dependency',
+                );
+                reply.code(503).send({
+                    error: 'service_unavailable',
+                    message: 'MFA verification not ready.',
+                });
+                return;
+            }
+
+            // -------------------------------------------------------------
+            // 3. JSON body validation. The body intentionally does NOT
+            //    carry `actorId` — the principal-trust invariant (step 4)
+            //    forces the JWT subject into that slot.
+            // -------------------------------------------------------------
+            const parsed = VerifyMfaRequestSchema.safeParse(req.body);
+            if (!parsed.success) {
+                reply.code(400).send({
+                    error: 'invalid_request',
+                    message: 'Request body failed validation.',
+                    details: parsed.error.issues.map((i) => ({
+                        path: i.path.join('.'),
+                        code: i.code,
+                    })),
+                });
+                return;
+            }
+
+            const body = parsed.data;
+
+            // -------------------------------------------------------------
+            // 4. Principal-trust invariant. The JWT subject is the
+            //    trusted principal attempting the step-up. The body's
+            //    `actorId` field does NOT exist (the command enforces
+            //    `actorId === factor.actor`); we never trust a client-
+            //    supplied actor identity for verification.
+            // -------------------------------------------------------------
+            const verifiedSubject = req.principal?.subject;
+            if (!verifiedSubject || verifiedSubject.length === 0) {
+                // Defence-in-depth: requireScope should have already
+                // rejected this, but a misconfigured token could still
+                // pass with an empty subject. Fail closed.
+                deps.logger.warn(
+                    { reqId: req.id },
+                    'aadhaar-vault mfa-verify reached handler without a JWT subject',
+                );
+                reply.code(401).send({
+                    error: 'unauthorized',
+                    message: 'Verification requires an authenticated principal.',
+                });
+                return;
+            }
+            const actorId = verifiedSubject;
+            const actorRole = body.context.actorRole;
+
+            // -------------------------------------------------------------
+            // 5. Build and invoke the command. The audit + event
+            //    publish paths travel through the same `db.audit`
+            //    and `events` as every other command.
+            // -------------------------------------------------------------
+            const command = makeVerifyMfa({
+                keyManager,
+                totp,
+                mfa: db.mfa,
+                audit: db.audit as AuditRepository,
+                events,
+            });
+
+            try {
+                const result = await command({
+                    factorId: body.factorId,
+                    code: body.code,
+                    // Enforce the principal-trust invariant at the
+                    // application layer: the JWT subject MUST own the
+                    // factor or the command returns ACTOR_MISMATCH
+                    // (also mapped to 401, so an attacker cannot
+                    // probe which factor ids exist for other
+                    // principals).
+                    expectedActor: actorId,
+                    ...(body.window !== undefined
+                        ? { window: body.window }
+                        : {}),
+                    context: {
+                        actorId,
+                        actorRole,
+                        reason: body.context.reason,
+                        requestId:
+                            body.context.requestId ?? req.id ?? undefined,
+                        sourceIp: body.context.sourceIp ?? req.ip,
+                        userAgent:
+                            body.context.userAgent ??
+                            (req.headers['user-agent']
+                                ? String(req.headers['user-agent'])
+                                : undefined),
+                    },
+                });
+
+                // Project the discriminated union 1:1.
+                //   - `valid: true`  → 200 with the factor envelope
+                //     (no `encryptedSecret`).
+                //   - `valid: false` → 401 with the stable reason tag.
+                // The failure path never echoes the factor row
+                // (only `factorId | null`) so a probing attacker
+                // gets the same 401 whether the factor exists,
+                // is revoked, is expired, belongs to another
+                // actor, or simply had a wrong code typed.
+                if (result.valid) {
+                    reply.code(200).send({
+                        valid: true,
+                        factorId: result.factorId,
+                        actor: result.actor,
+                        delta: result.delta,
+                        factor: projectFactorForVerify(result.factor),
+                    });
+                    return;
+                }
+                const status =
+                    VERIFY_FAILURE_STATUS[result.reason] ?? 401;
+                reply.code(status).send({
+                    valid: false,
+                    factorId: result.factorId,
+                    error: result.reason,
+                    message:
+                        VERIFY_FAILURE_MESSAGES[result.reason] ??
+                        'Verification failed.',
+                });
+            } catch (err) {
+                if (err instanceof VerifyMfaCommandError) {
+                    deps.logger.info(
+                        {
+                            errCode: err.code,
+                            actorId,
+                            actorRole,
+                            targetFactor: body.factorId,
+                            reqId: req.id,
+                        },
+                        'aadhaar-vault mfa-verify rejected',
+                    );
+                    replyForVerifyCommandError(reply, err);
+                    return;
+                }
+                deps.logger.error(
+                    { err, reqId: req.id },
+                    'aadhaar-vault mfa-verify unexpected error',
                 );
                 throw err;
             }
