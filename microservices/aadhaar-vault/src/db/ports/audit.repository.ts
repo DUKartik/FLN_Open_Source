@@ -25,7 +25,14 @@ export interface AuditRecord extends AuditEntry {
 }
 
 export interface AuditRepository {
-    append(entry: AuditEntry): Promise<void>;
+    /**
+     * Append an audit row. Returns the assigned `audit_id`
+     * (positive integer) so the caller can link related rows
+     * (e.g. a `vault_step_up_challenges.audit_id` column that
+     * points at the canonical audit row). Throws on DB failure;
+     * never returns `null` / `undefined`.
+     */
+    append(entry: AuditEntry): Promise<number>;
     listByIdentity(
         identityId: string,
         opts?: { limit?: number },

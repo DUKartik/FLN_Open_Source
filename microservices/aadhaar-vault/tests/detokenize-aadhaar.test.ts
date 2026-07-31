@@ -1,35 +1,55 @@
 /**
- * Unit tests for the `DetokenizeAadhaar` command (Session 5C).
+ * Unit tests for the `DetokenizeAadhaar` command (Session 7E).
  *
  * Scope: behaviour of the command as a piece of orchestration. We
- * stub the five ports — `KeyManager`, `CryptoService`,
+ * stub the seven ports — `KeyManager`, `CryptoService`,
  * `TokenRepository`, `IdentityRepository`, `AuditRepository`,
- * `EventPublisher` — so a failure here is a command-logic failure,
- * not an adapter failure. Adapter correctness is verified in the
- * per-adapter suites.
+ * `EventPublisher`, `StepUpChallengeRepository` — so a failure here
+ * is a command-logic failure, not an adapter failure. Adapter
+ * correctness is verified in the per-adapter suites.
  *
- * The nine cases below are the minimum a green build needs to
- * consider the detokenize pipeline done:
+ * The cases below are the minimum a green build needs to consider
+ * the Session 7E release step done:
  *
- *   1. Happy path: tokenize → detokenize round-trip recovers the
- *      original plaintext and surfaces all the §6.x fields.
- *   2. Empty `token` throws `INVALID_INPUT`, never touches the
- *      repositories.
+ *   1. Happy path: a pre-populated, approved, unexpired,
+ *      unconsumed challenge row → tokenize → detokenize
+ *      round-trip recovers the original plaintext and surfaces
+ *      every §7E field, including `challenge_id` and
+ *      `verified_factor_id` on the audit row and the
+ *      `DetokenizationCompleted` event.
+ *   2. Empty `challengeId` throws `INVALID_INPUT`, never touches
+ *      any repository.
  *   3. Empty `context.actorId` throws `INVALID_INPUT`, never
- *      touches the repositories.
- *   4. Token id not in the repository throws `TOKEN_NOT_FOUND`.
- *   5. Token row present but parent identity missing throws
- *      `IDENTITY_NOT_FOUND`.
- *   6. `KeyManager.unwrapDataKey` throws → re-wrapped as
- *      `UNWRAP_FAILED`.
- *   7. `CryptoService.decrypt` throws → re-wrapped as
- *      `DECRYPTION_FAILED`.
- *   8. Audit row is appended with the DETOKENIZE action and the
- *      correct meta block; the event is published AFTER the
- *      audit append so a failed append suppresses a phantom
- *      event.
- *   9. Plaintext hygiene: `dek` is zeroed on the happy path and
+ *      touches any repository.
+ *   4. `CHALLENGE_NOT_FOUND` — repository returns null → throw,
+ *      no audit, no event.
+ *   5. `CHALLENGE_NOT_APPROVED` — challenge row present but
+ *      status is `pending` → throw, no audit, no event.
+ *   6. `CHALLENGE_EXPIRED` — `expiresAt` is in the past → throw,
+ *      no audit, no event.
+ *   7. `CHALLENGE_CONSUMED` (replay) — `findById` returns an
+ *      `approved` row but `consume()` returns null (race-window
+ *      scenario: another caller already consumed the row)
+ *      → throw, no audit, no event.
+ *   8. `ACTOR_MISMATCH` — `requestedBy` on the challenge does
+ *      not match `context.actorId` → throw, no audit, no event.
+ *   9. `TOKEN_NOT_FOUND` — challenge references a token row that
+ *      does not exist → throw, no audit, no event.
+ *  10. `IDENTITY_NOT_FOUND` — token row present but parent
+ *      identity missing → throw, no audit, no event.
+ *  11. `UNWRAP_FAILED` — `KeyManager.unwrapDataKey` throws
+ *      → re-wrapped as UNWRAP_FAILED, no audit, no event.
+ *  12. `DECRYPTION_FAILED` — `CryptoService.decrypt` throws
+ *      → re-wrapped as DECRYPTION_FAILED, no audit, no event.
+ *  13. `INVALID_PAYLOAD` — recovered plaintext is not a
+ *      12-digit Aadhaar → throw, no audit, no event.
+ *  14. Audit-order invariant: event is published AFTER the audit
+ *      append; failed append suppresses event.
+ *  15. Plaintext hygiene: `dek` is zeroed on the happy path and
  *      on every throw branch.
+ *
+ * Plaintext-zeroization is enforced both locally in case 15 and
+ * via the suite-level `afterEach` guard.
  */
 
 import {
@@ -64,27 +84,37 @@ import type {
 } from '../src/application/ports/event-publisher.js';
 import type { KeyManager } from '../src/application/ports/key-manager.js';
 import type { CryptoService } from '../src/application/ports/crypto.service.js';
+import type {
+    StepUpChallenge,
+    StepUpChallengeRepository,
+    StepUpChallengeStatus,
+} from '../src/application/ports/step-up-challenge.repository.js';
 
 // ---------------------------------------------------------------------------
-// Shared fixture constants — declared before the fakes so the
-// fake `KeyManager` can seed its lookup map against the same
-// `wrappedDek` bytes the token-row helper below uses.
+// Shared fixture constants
 // ---------------------------------------------------------------------------
 
 const FIXED_IDENTITY_ID = '00000000-0000-4000-8000-000000000001';
 const FIXED_TOKEN_ID = '11111111-1111-4111-8111-111111111111';
-const FIXED_AAD = Buffer.from(
-    'aadhaar-vault/v1|kv=kv-1|schema=1|identity=' + FIXED_IDENTITY_ID,
-    'utf8',
-);
+const FIXED_CHALLENGE_ID = '22222222-2222-4222-8222-222222222222';
+const FIXED_FACTOR_ID = '33333333-3333-4333-8333-333333333333';
+
 const FIXED_CIPHERTEXT = Buffer.from('123456789012', 'utf8'); // 12 bytes
 const FIXED_PLAINTEXT = Buffer.from('123456789012', 'utf8'); // same bytes
 const FIXED_IV = Buffer.from('00112233445566778899aabb', 'hex');
 const FIXED_AUTHTAG = Buffer.alloc(16, 0xaa);
 const FIXED_WRAPPED_DEK = Buffer.from('cafebabe'.repeat(8), 'hex');
 
+// Default `requestedBy` aligns with the actor id in BASE_CONTEXT so
+// the actor-binding check succeeds by default.
+const FIXED_REQUESTED_BY = 'state-admin-1';
+const FIXED_REQUESTED_AT = new Date('2026-01-15T11:55:00Z');
+// `expiresAt` is well past the default clock() in `makeDeps`.
+const FIXED_EXPIRES_AT = new Date('2026-01-15T13:00:00Z');
+const FIXED_CLOCK = new Date('2026-01-15T12:30:00Z');
+
 // ---------------------------------------------------------------------------
-// Fakes — minimal interfaces the command actually exercises.
+// Fakes — minimal interfaces the command actually exercises
 // ---------------------------------------------------------------------------
 
 /**
@@ -101,12 +131,6 @@ function makeFakeKeyManager(opts: {
     failUnwrap?: boolean;
 } = {}): KeyManager {
     const store = new Map<string, Buffer>();
-    // Seed the store so a pre-populated token row (whose
-    // `wrappedDek` is the constant `cafebabe` bytes) can be
-    // unwrapped without going through `generateDataKey` first. The
-    // tests that exercise the full tokenize → detokenize round
-    // trip use the same `generateDataKey` flow and overwrite /
-    // re-record the same key, so seeding here is benign.
     const seededPlaintext = Buffer.from('deadbeef'.repeat(4), 'hex');
     store.set(FIXED_WRAPPED_DEK.toString('hex'), seededPlaintext);
     return {
@@ -119,11 +143,6 @@ function makeFakeKeyManager(opts: {
         },
         async generateDataKey(_wrapContext) {
             const plaintext = Buffer.from('deadbeef'.repeat(4), 'hex');
-            // Fake wrap = constant bytes; the store is keyed on a
-            // hex string of those bytes, not the plaintext. The
-            // fixture token row pre-populates its `wrappedDek`
-            // with these same bytes so `unwrapDataKey` can find
-            // the recorded DEK.
             const fakeWrappedBytes = Buffer.from(
                 'cafebabe'.repeat(8),
                 'hex',
@@ -146,10 +165,6 @@ function makeFakeKeyManager(opts: {
                     `fake KeyManager: no recorded DEK for wrapped bytes ${key.slice(0, 8)}…`,
                 );
             }
-            // Return a fresh allocation so the command's
-            // safeZero() does not mutate the stored plaintext,
-            // and capture that fresh allocation so the test can
-            // assert the safeZero actually ran.
             const fresh = Buffer.from(plaintext);
             if (opts.captured) opts.captured.dek = fresh;
             return fresh;
@@ -169,9 +184,7 @@ function makeFakeKeyManager(opts: {
 /**
  * Fake `CryptoService`. The detokenize path calls only `decrypt`,
  * so we expose a store-and-recall cipher keyed on ciphertext
- * bytes. `encrypt` is included for completeness but is not used
- * by `DetokenizeAadhaar` directly (tests that want a tokenize →
- * detokenize round-trip prime the store directly).
+ * bytes.
  */
 function makeFakeCrypto(opts: {
     captured?: { plaintext?: Buffer };
@@ -188,7 +201,7 @@ function makeFakeCrypto(opts: {
     return {
         algorithm: 'aes-256-gcm',
         async encrypt(_key, plaintext, _aad) {
-            const ciphertext = Buffer.from(plaintext); // identity copy
+            const ciphertext = Buffer.from(plaintext);
             store.set(ciphertext.toString('hex'), plaintext);
             if (opts.captured) opts.captured.plaintext = plaintext;
             return {
@@ -214,18 +227,26 @@ function makeFakeCrypto(opts: {
 }
 
 /** Recording audit repository — exposes the appended entries. */
-type RecordingAudit = AuditRepository & { entries: AuditEntry[] };
+type RecordingAudit = AuditRepository & {
+    entries: AuditEntry[];
+    nextAuditId: number;
+};
 function makeRecordingAudit(): RecordingAudit {
     const entries: AuditEntry[] = [];
-    return {
+    const audit: RecordingAudit = {
         entries,
+        nextAuditId: 1,
         async append(entry) {
             entries.push(entry);
+            const id = audit.nextAuditId;
+            audit.nextAuditId += 1;
+            return id;
         },
         async listByIdentity() {
             return [];
         },
     };
+    return audit;
 }
 
 /** Recording publisher — exposes published events. */
@@ -281,11 +302,33 @@ function makeTokenRepo(opts: {
 
 /**
  * In-memory identity repository. Tests can pre-populate rows.
+ *
+ * Note: the AAD is computed identically to what the tokenize
+ * pipeline emits; the fake fixes `FIXED_IDENTITY_ID` and the
+ * standard `kv-1 / schema=1` prefix so the unwrap pipeline
+ * resolves correctly without standing up the tokenize command.
  */
 function makeIdentityRepo(opts: {
     rows?: IdentityRecord[];
 } = {}): IdentityRepository & { rows: IdentityRecord[] } {
-    const rows = opts.rows ? [...opts.rows] : [];
+    const aad = Buffer.from(
+        'aadhaar-vault/v1|kv=kv-1|schema=1|identity=' + FIXED_IDENTITY_ID,
+        'utf8',
+    );
+    const rows = opts.rows
+        ? [...opts.rows]
+        : [
+              {
+                  identityId: FIXED_IDENTITY_ID,
+                  ciphertext: FIXED_CIPHERTEXT,
+                  aad,
+                  pepperVersion: 1,
+                  keyVersion: 1,
+                  createdAt: new Date('2026-01-15T12:00:00Z'),
+                  rotatedAt: null,
+                  revokedAt: null,
+              },
+          ];
     return {
         rows,
         async insert(rec) {
@@ -310,32 +353,114 @@ function makeIdentityRepo(opts: {
     };
 }
 
+/**
+ * In-memory step-up challenge repository. Tests can pre-populate
+ * challenges and toggle `failConsumeNext` to simulate the
+ * race-window `consume()` rejection that surfaces as
+ * `CHALLENGE_CONSUMED`.
+ *
+ * `consume()` mirrors the production contract:
+ *   - status must currently be `approved` AND `expiresAt` must be
+ *     in the future;
+ *   - on success, returns the row with `status='consumed'` and
+ *     `consumedAt` stamped.
+ *   - on failure (status mismatch / already consumed / expired),
+ *     returns `null`. The command translates every failure here to
+ *     `CHALLENGE_CONSUMED` because the *intent* — first-call-wins
+ *     — is the same.
+ */
+function makeFakeChallenges(opts: {
+    rows?: StepUpChallenge[];
+    failConsumeNext?: boolean;
+} = {}): StepUpChallengeRepository & {
+    rows: StepUpChallenge[];
+    consumed: string[];
+} {
+    const rows: StepUpChallenge[] = opts.rows ? [...opts.rows] : [];
+    const consumed: string[] = [];
+    return {
+        rows,
+        consumed,
+        async create(input) {
+            const row: StepUpChallenge = {
+                challengeId: input.challengeId,
+                operation: input.operation,
+                identityId: input.identityId,
+                tokenId: input.tokenId,
+                requestedBy: input.requestedBy,
+                requestedAt: input.requestedAt,
+                expiresAt: input.expiresAt,
+                approvedAt: null,
+                consumedAt: null,
+                status: 'pending',
+                requiredFactorId: input.requiredFactorId,
+                verifiedFactorId: null,
+                auditId: null,
+                metadata: input.metadata,
+            };
+            rows.push(row);
+            return row;
+        },
+        async findById(id) {
+            return rows.find((r) => r.challengeId === id) ?? null;
+        },
+        async approve(input) {
+            const row = rows.find(
+                (r) => r.challengeId === input.challengeId,
+            );
+            if (!row || row.status !== 'pending') return null;
+            row.status = 'approved';
+            row.approvedAt = input.approvedAt;
+            row.verifiedFactorId = input.verifiedFactorId;
+            row.auditId = input.auditId;
+            return row;
+        },
+        async consume(id, consumedAt) {
+            if (opts.failConsumeNext) {
+                opts.failConsumeNext = false;
+                return null;
+            }
+            const row = rows.find((r) => r.challengeId === id);
+            if (!row) return null;
+            if (row.status !== 'approved') return null;
+            if (row.expiresAt.getTime() <= consumedAt.getTime()) {
+                return null;
+            }
+            row.status = 'consumed';
+            row.consumedAt = consumedAt;
+            consumed.push(id);
+            return row;
+        },
+        async expire(id) {
+            const row = rows.find((r) => r.challengeId === id);
+            if (!row || row.status !== 'pending') return null;
+            row.status = 'expired';
+            return row;
+        },
+        async fail(id) {
+            const row = rows.find((r) => r.challengeId === id);
+            if (!row || row.status !== 'pending') return null;
+            row.status = 'failed';
+            return row;
+        },
+        async deleteExpired() {
+            return 0;
+        },
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 const BASE_CONTEXT: DetokenizeCallerContext = {
-    actorId: 'state-admin-1',
+    actorId: FIXED_REQUESTED_BY,
     actorRole: 'STATE_ADMIN',
     reason: 'compliance review FLN-2026-Q3',
     requestId: 'req-detok-001',
     sourceIp: '10.0.0.7',
     userAgent: 'fln-portal/0.1',
 };
-
-function makeIdentityRow(overrides: Partial<IdentityRecord> = {}): IdentityRecord {
-    return {
-        identityId: FIXED_IDENTITY_ID,
-        ciphertext: FIXED_CIPHERTEXT,
-        aad: FIXED_AAD,
-        pepperVersion: 1,
-        keyVersion: 1,
-        createdAt: new Date('2026-01-15T12:00:00Z'),
-        rotatedAt: null,
-        revokedAt: null,
-        ...overrides,
-    };
-}
 
 function makeTokenRow(overrides: Partial<TokenRow> = {}): TokenRow {
     return {
@@ -351,6 +476,28 @@ function makeTokenRow(overrides: Partial<TokenRow> = {}): TokenRow {
     };
 }
 
+function makeChallenge(
+    overrides: Partial<StepUpChallenge> = {},
+): StepUpChallenge {
+    return {
+        challengeId: FIXED_CHALLENGE_ID,
+        operation: 'detokenize',
+        identityId: FIXED_IDENTITY_ID,
+        tokenId: FIXED_TOKEN_ID,
+        requestedBy: FIXED_REQUESTED_BY,
+        requestedAt: FIXED_REQUESTED_AT,
+        expiresAt: FIXED_EXPIRES_AT,
+        approvedAt: FIXED_CLOCK,
+        consumedAt: null,
+        status: 'approved' as StepUpChallengeStatus,
+        requiredFactorId: FIXED_FACTOR_ID,
+        verifiedFactorId: FIXED_FACTOR_ID,
+        auditId: 'audit-001',
+        metadata: null,
+        ...overrides,
+    };
+}
+
 interface DepsHandle {
     deps: DetokenizeAadhaarDeps;
     captured: { dek?: Buffer; plaintext?: Buffer };
@@ -358,17 +505,23 @@ interface DepsHandle {
     publisher: RecordingPublisher;
     tokens: ReturnType<typeof makeTokenRepo>;
     identities: ReturnType<typeof makeIdentityRepo>;
+    challenges: ReturnType<typeof makeFakeChallenges>;
 }
 
 function makeDeps(opts: {
     tokens?: TokenRow[];
     identities?: IdentityRecord[];
+    challenges?: StepUpChallenge[];
     preloadedCiphertext?: { ct: Buffer; pt: Buffer };
     failUnwrap?: boolean;
     failDecrypt?: boolean;
+    failConsumeNext?: boolean;
 } = {}): DepsHandle {
     const captured: { dek?: Buffer; plaintext?: Buffer } = {};
-    const keyManager = makeFakeKeyManager({ captured, failUnwrap: opts.failUnwrap });
+    const keyManager = makeFakeKeyManager({
+        captured,
+        failUnwrap: opts.failUnwrap,
+    });
     const crypto = makeFakeCrypto({
         captured,
         failDecrypt: opts.failDecrypt,
@@ -378,6 +531,10 @@ function makeDeps(opts: {
     const publisher = makeRecordingPublisher();
     const tokens = makeTokenRepo({ rows: opts.tokens });
     const identities = makeIdentityRepo({ rows: opts.identities });
+    const challenges = makeFakeChallenges({
+        rows: opts.challenges ?? [makeChallenge()],
+        failConsumeNext: opts.failConsumeNext,
+    });
     const deps: DetokenizeAadhaarDeps = {
         keyManager,
         crypto,
@@ -385,16 +542,25 @@ function makeDeps(opts: {
         identities,
         audit,
         events: publisher,
-        clock: () => new Date('2026-01-15T12:30:00Z'),
+        challenges,
+        clock: () => FIXED_CLOCK,
     };
-    return { deps, captured, audit, publisher, tokens, identities };
+    return {
+        deps,
+        captured,
+        audit,
+        publisher,
+        tokens,
+        identities,
+        challenges,
+    };
 }
 
 // ---------------------------------------------------------------------------
 // Suite
 // ---------------------------------------------------------------------------
 
-describe('DetokenizeAadhaar command', () => {
+describe('DetokenizeAadhaar command (Session 7E — challenge-based)', () => {
     let capturedDek: { dek?: Buffer } = {};
 
     beforeEach(() => {
@@ -416,10 +582,9 @@ describe('DetokenizeAadhaar command', () => {
         }
     });
 
-    it('1. happy path — recovers plaintext, writes DETOKENIZE audit, publishes AadhaarDetokenized', async () => {
-        const { deps, captured, audit, publisher } = makeDeps({
+    it('1. happy path — recovers plaintext, writes DETOKENIZE audit with challenge_id + verified_factor_id, publishes DetokenizationCompleted', async () => {
+        const { deps, captured, audit, publisher, challenges } = makeDeps({
             tokens: [makeTokenRow()],
-            identities: [makeIdentityRow()],
             preloadedCiphertext: {
                 ct: FIXED_CIPHERTEXT,
                 pt: FIXED_PLAINTEXT,
@@ -429,7 +594,7 @@ describe('DetokenizeAadhaar command', () => {
         const cmd = makeDetokenizeAadhaar(deps);
 
         const result = await cmd({
-            token: FIXED_TOKEN_ID,
+            challengeId: FIXED_CHALLENGE_ID,
             context: BASE_CONTEXT,
         });
 
@@ -440,21 +605,24 @@ describe('DetokenizeAadhaar command', () => {
         expect(result.last4).toBe('9012');
         expect(result.auditId).toBe('req-detok-001');
 
-        // Audit row: action=DETOKENIZE, outcome=allow, meta populated.
+        // Audit row: action=DETOKENIZE, outcome=allow, meta carries
+        // the Session 7E correlation fields.
         expect(audit.entries.length).toBe(1);
         const ae = audit.entries[0]!;
         expect(ae.action).toBe('DETOKENIZE');
         expect(ae.outcome).toBe('allow');
-        expect(ae.actor).toBe('state-admin-1');
+        expect(ae.actor).toBe(FIXED_REQUESTED_BY);
         expect(ae.identityId).toBe(FIXED_IDENTITY_ID);
         expect(ae.requestId).toBe('req-detok-001');
         expect(ae.reason).toBe('compliance review FLN-2026-Q3');
         expect(ae.meta).toMatchObject({
+            challenge_id: FIXED_CHALLENGE_ID,
             token_id: FIXED_TOKEN_ID,
             actor_role: 'STATE_ADMIN',
             key_version: 1,
             pepper_version: 1,
             algorithm: 'aes-256-gcm',
+            verified_factor_id: FIXED_FACTOR_ID,
             source_ip: '10.0.0.7',
             user_agent: 'fln-portal/0.1',
         });
@@ -462,32 +630,50 @@ describe('DetokenizeAadhaar command', () => {
         // Event published AFTER the audit append.
         expect(publisher.events.length).toBe(1);
         const ev = publisher.events[0]!;
-        expect(ev.type).toBe('AadhaarDetokenized');
-        expect(ev.token).toBe(FIXED_TOKEN_ID);
+        expect(ev.type).toBe('DetokenizationCompleted');
+        expect((ev as unknown as { challengeId: string }).challengeId).toBe(
+            FIXED_CHALLENGE_ID,
+        );
+        expect((ev as unknown as { tokenId: string }).tokenId).toBe(
+            FIXED_TOKEN_ID,
+        );
         expect(ev.identityId).toBe(FIXED_IDENTITY_ID);
         expect(ev.last4).toBe('9012');
-        expect(ev.actorId).toBe('state-admin-1');
+        expect(ev.actorId).toBe(FIXED_REQUESTED_BY);
         expect(ev.actorRole).toBe('STATE_ADMIN');
-        expect(ev.occurredAt).toBe('2026-01-15T12:30:00.000Z');
+        expect(
+            (ev as unknown as { verifiedFactorId: string }).verifiedFactorId,
+        ).toBe(FIXED_FACTOR_ID);
+        expect(ev.occurredAt).toBe(FIXED_CLOCK.toISOString());
+
+        // Replay protection — the challenge was atomically consumed.
+        expect(challenges.consumed).toEqual([FIXED_CHALLENGE_ID]);
+        const stored = challenges.rows.find(
+            (r) => r.challengeId === FIXED_CHALLENGE_ID,
+        );
+        expect(stored?.status).toBe('consumed');
+        expect(stored?.consumedAt?.toISOString()).toBe(
+            FIXED_CLOCK.toISOString(),
+        );
     });
 
-    it('2. invalid input — empty token throws INVALID_INPUT, never touches repositories', async () => {
-        const { deps, audit, publisher, tokens, identities } = makeDeps({
-            tokens: [makeTokenRow()],
-            identities: [makeIdentityRow()],
-        });
+    it('2. invalid input — empty challengeId throws INVALID_INPUT, never touches repositories', async () => {
+        const { deps, audit, publisher, tokens, identities, challenges } =
+            makeDeps();
+        const findChallengeSpy = vi.spyOn(challenges, 'findById');
         const findSpy = vi.spyOn(tokens, 'findById');
         const getSpy = vi.spyOn(identities, 'getById');
 
         const cmd = makeDetokenizeAadhaar(deps);
 
         await expect(
-            cmd({ token: '', context: BASE_CONTEXT }),
+            cmd({ challengeId: '', context: BASE_CONTEXT }),
         ).rejects.toMatchObject({
             name: 'DetokenizeCommandError',
             code: 'INVALID_INPUT',
         });
 
+        expect(findChallengeSpy).not.toHaveBeenCalled();
         expect(findSpy).not.toHaveBeenCalled();
         expect(getSpy).not.toHaveBeenCalled();
         expect(audit.entries).toEqual([]);
@@ -495,10 +681,9 @@ describe('DetokenizeAadhaar command', () => {
     });
 
     it('3. invalid input — empty actorId throws INVALID_INPUT, never touches repositories', async () => {
-        const { deps, audit, publisher, tokens, identities } = makeDeps({
-            tokens: [makeTokenRow()],
-            identities: [makeIdentityRow()],
-        });
+        const { deps, audit, publisher, tokens, identities, challenges } =
+            makeDeps();
+        const findChallengeSpy = vi.spyOn(challenges, 'findById');
         const findSpy = vi.spyOn(tokens, 'findById');
         const getSpy = vi.spyOn(identities, 'getById');
 
@@ -506,7 +691,7 @@ describe('DetokenizeAadhaar command', () => {
 
         await expect(
             cmd({
-                token: FIXED_TOKEN_ID,
+                challengeId: FIXED_CHALLENGE_ID,
                 context: { ...BASE_CONTEXT, actorId: '' },
             }),
         ).rejects.toMatchObject({
@@ -514,21 +699,150 @@ describe('DetokenizeAadhaar command', () => {
             code: 'INVALID_INPUT',
         });
 
+        expect(findChallengeSpy).not.toHaveBeenCalled();
         expect(findSpy).not.toHaveBeenCalled();
         expect(getSpy).not.toHaveBeenCalled();
         expect(audit.entries).toEqual([]);
         expect(publisher.events).toEqual([]);
     });
 
-    it('4. token not found — throws TOKEN_NOT_FOUND, no audit, no event', async () => {
-        const { deps, audit, publisher } = makeDeps({
-            identities: [makeIdentityRow()],
-        });
+    it('4. CHALLENGE_NOT_FOUND — repository returns null, no audit, no event', async () => {
+        const { deps, audit, publisher } = makeDeps();
         const cmd = makeDetokenizeAadhaar(deps);
 
         await expect(
             cmd({
-                token: 'does-not-exist',
+                challengeId: 'does-not-exist',
+                context: BASE_CONTEXT,
+            }),
+        ).rejects.toMatchObject({
+            name: 'DetokenizeCommandError',
+            code: 'CHALLENGE_NOT_FOUND',
+        });
+
+        expect(audit.entries).toEqual([]);
+        expect(publisher.events).toEqual([]);
+    });
+
+    it('5. CHALLENGE_NOT_APPROVED — status=pending throws, no audit, no event', async () => {
+        const { deps, audit, publisher, challenges } = makeDeps({
+            challenges: [makeChallenge({ status: 'pending', approvedAt: null })],
+        });
+        const consumeSpy = vi.spyOn(challenges, 'consume');
+
+        const cmd = makeDetokenizeAadhaar(deps);
+
+        await expect(
+            cmd({
+                challengeId: FIXED_CHALLENGE_ID,
+                context: BASE_CONTEXT,
+            }),
+        ).rejects.toMatchObject({
+            name: 'DetokenizeCommandError',
+            code: 'CHALLENGE_NOT_APPROVED',
+        });
+
+        expect(consumeSpy).not.toHaveBeenCalled();
+        expect(audit.entries).toEqual([]);
+        expect(publisher.events).toEqual([]);
+    });
+
+    it('6. CHALLENGE_EXPIRED — expiresAt in the past throws, no audit, no event', async () => {
+        const { deps, audit, publisher, challenges } = makeDeps({
+            challenges: [
+                makeChallenge({
+                    expiresAt: new Date('2026-01-15T12:00:00Z'), // before FIXED_CLOCK (12:30)
+                }),
+            ],
+        });
+        const consumeSpy = vi.spyOn(challenges, 'consume');
+
+        const cmd = makeDetokenizeAadhaar(deps);
+
+        await expect(
+            cmd({
+                challengeId: FIXED_CHALLENGE_ID,
+                context: BASE_CONTEXT,
+            }),
+        ).rejects.toMatchObject({
+            name: 'DetokenizeCommandError',
+            code: 'CHALLENGE_EXPIRED',
+        });
+
+        expect(consumeSpy).not.toHaveBeenCalled();
+        expect(audit.entries).toEqual([]);
+        expect(publisher.events).toEqual([]);
+    });
+
+    it('7. CHALLENGE_CONSUMED (replay) — consume() rejects, no audit, no event', async () => {
+        // Race-window simulation: findById sees an `approved`
+        // challenge, but consume() rejects (someone else consumed
+        // it between the two calls).
+        const { deps, audit, publisher, challenges } = makeDeps({
+            failConsumeNext: true,
+        });
+        const consumeSpy = vi.spyOn(challenges, 'consume');
+
+        const cmd = makeDetokenizeAadhaar(deps);
+
+        await expect(
+            cmd({
+                challengeId: FIXED_CHALLENGE_ID,
+                context: BASE_CONTEXT,
+            }),
+        ).rejects.toMatchObject({
+            name: 'DetokenizeCommandError',
+            code: 'CHALLENGE_CONSUMED',
+        });
+
+        expect(consumeSpy).toHaveBeenCalledTimes(1);
+        expect(audit.entries).toEqual([]);
+        expect(publisher.events).toEqual([]);
+
+        // The challenge row should still be `approved` — a failed
+        // consume() never flips the row.
+        const stored = challenges.rows.find(
+            (r) => r.challengeId === FIXED_CHALLENGE_ID,
+        );
+        expect(stored?.status).toBe('approved');
+        expect(challenges.consumed).toEqual([]);
+    });
+
+    it('8. ACTOR_MISMATCH — challenge.requestedBy != context.actorId throws, no audit, no event', async () => {
+        const { deps, audit, publisher, challenges } = makeDeps({
+            challenges: [
+                makeChallenge({ requestedBy: 'someone-else' }),
+            ],
+        });
+        const consumeSpy = vi.spyOn(challenges, 'consume');
+
+        const cmd = makeDetokenizeAadhaar(deps);
+
+        await expect(
+            cmd({
+                challengeId: FIXED_CHALLENGE_ID,
+                context: BASE_CONTEXT,
+            }),
+        ).rejects.toMatchObject({
+            name: 'DetokenizeCommandError',
+            code: 'ACTOR_MISMATCH',
+        });
+
+        expect(consumeSpy).not.toHaveBeenCalled();
+        expect(audit.entries).toEqual([]);
+        expect(publisher.events).toEqual([]);
+    });
+
+    it('9. TOKEN_NOT_FOUND — challenge.tokenId not in tokens table throws, no audit, no event', async () => {
+        const { deps, audit, publisher } = makeDeps({
+            tokens: [], // intentionally empty
+        });
+
+        const cmd = makeDetokenizeAadhaar(deps);
+
+        await expect(
+            cmd({
+                challengeId: FIXED_CHALLENGE_ID,
                 context: BASE_CONTEXT,
             }),
         ).rejects.toMatchObject({
@@ -540,16 +854,17 @@ describe('DetokenizeAadhaar command', () => {
         expect(publisher.events).toEqual([]);
     });
 
-    it('5. identity row missing — throws IDENTITY_NOT_FOUND, no audit, no event', async () => {
+    it('10. IDENTITY_NOT_FOUND — token row present but parent identity missing throws, no audit, no event', async () => {
         const { deps, audit, publisher } = makeDeps({
             tokens: [makeTokenRow()],
             identities: [], // intentionally empty
         });
+
         const cmd = makeDetokenizeAadhaar(deps);
 
         await expect(
             cmd({
-                token: FIXED_TOKEN_ID,
+                challengeId: FIXED_CHALLENGE_ID,
                 context: BASE_CONTEXT,
             }),
         ).rejects.toMatchObject({
@@ -561,17 +876,17 @@ describe('DetokenizeAadhaar command', () => {
         expect(publisher.events).toEqual([]);
     });
 
-    it('6. KeyManager.unwrapDataKey fails — re-wrapped as UNWRAP_FAILED, no audit, no event', async () => {
+    it('11. UNWRAP_FAILED — KeyManager.unwrapDataKey throws, no audit, no event', async () => {
         const { deps, audit, publisher } = makeDeps({
             tokens: [makeTokenRow()],
-            identities: [makeIdentityRow()],
             failUnwrap: true,
         });
+
         const cmd = makeDetokenizeAadhaar(deps);
 
         await expect(
             cmd({
-                token: FIXED_TOKEN_ID,
+                challengeId: FIXED_CHALLENGE_ID,
                 context: BASE_CONTEXT,
             }),
         ).rejects.toMatchObject({
@@ -583,17 +898,17 @@ describe('DetokenizeAadhaar command', () => {
         expect(publisher.events).toEqual([]);
     });
 
-    it('7. CryptoService.decrypt fails — re-wrapped as DECRYPTION_FAILED, no audit, no event', async () => {
+    it('12. DECRYPTION_FAILED — CryptoService.decrypt throws, no audit, no event', async () => {
         const { deps, audit, publisher } = makeDeps({
             tokens: [makeTokenRow()],
-            identities: [makeIdentityRow()],
             failDecrypt: true,
         });
+
         const cmd = makeDetokenizeAadhaar(deps);
 
         await expect(
             cmd({
-                token: FIXED_TOKEN_ID,
+                challengeId: FIXED_CHALLENGE_ID,
                 context: BASE_CONTEXT,
             }),
         ).rejects.toMatchObject({
@@ -605,12 +920,39 @@ describe('DetokenizeAadhaar command', () => {
         expect(publisher.events).toEqual([]);
     });
 
-    it('8. audit-append order — event is published AFTER the audit append; failed append suppresses event', async () => {
-        // First, the happy path: assert the call order.
+    it('13. INVALID_PAYLOAD — recovered plaintext is not a 12-digit Aadhaar, no audit, no event', async () => {
+        const { deps, audit, publisher } = makeDeps({
+            tokens: [makeTokenRow()],
+            preloadedCiphertext: {
+                ct: FIXED_CIPHERTEXT,
+                // 12 bytes but not digits — the toString('utf8')
+                // yields "abcdefghijkl", which fails the 12-digit
+                // regex in the command.
+                pt: Buffer.from('abcdefghijkl', 'utf8'),
+            },
+        });
+
+        const cmd = makeDetokenizeAadhaar(deps);
+
+        await expect(
+            cmd({
+                challengeId: FIXED_CHALLENGE_ID,
+                context: BASE_CONTEXT,
+            }),
+        ).rejects.toMatchObject({
+            name: 'DetokenizeCommandError',
+            code: 'INVALID_PAYLOAD',
+        });
+
+        expect(audit.entries).toEqual([]);
+        expect(publisher.events).toEqual([]);
+    });
+
+    it('14. audit-append order — event is published AFTER the audit append; failed append suppresses event', async () => {
+        // Happy path: assert the call order.
         const callOrder: string[] = [];
         const { deps, audit, publisher } = makeDeps({
             tokens: [makeTokenRow()],
-            identities: [makeIdentityRow()],
             preloadedCiphertext: {
                 ct: FIXED_CIPHERTEXT,
                 pt: FIXED_PLAINTEXT,
@@ -629,16 +971,14 @@ describe('DetokenizeAadhaar command', () => {
 
         const cmd = makeDetokenizeAadhaar(deps);
         await cmd({
-            token: FIXED_TOKEN_ID,
+            challengeId: FIXED_CHALLENGE_ID,
             context: BASE_CONTEXT,
         });
         expect(callOrder).toEqual(['audit.append', 'events.publish']);
 
-        // Now, the failure path: audit append throws → publish
-        // never reached.
+        // Failure path: audit append throws → publish never reached.
         const { deps: depsFail, publisher: publisherFail } = makeDeps({
             tokens: [makeTokenRow()],
-            identities: [makeIdentityRow()],
             preloadedCiphertext: {
                 ct: FIXED_CIPHERTEXT,
                 pt: FIXED_PLAINTEXT,
@@ -650,18 +990,17 @@ describe('DetokenizeAadhaar command', () => {
         const cmdFail = makeDetokenizeAadhaar(depsFail);
         await expect(
             cmdFail({
-                token: FIXED_TOKEN_ID,
+                challengeId: FIXED_CHALLENGE_ID,
                 context: BASE_CONTEXT,
             }),
         ).rejects.toThrow(/disk full/i);
         expect(publisherFail.events).toEqual([]);
     });
 
-    it('9. plaintext hygiene — DEK bytes are zeroed on the happy path and on every throw branch', async () => {
+    it('15. plaintext hygiene — DEK bytes are zeroed on the happy path and on every throw branch', async () => {
         // Happy path: DEK is captured and zeroed.
         const { deps, captured } = makeDeps({
             tokens: [makeTokenRow()],
-            identities: [makeIdentityRow()],
             preloadedCiphertext: {
                 ct: FIXED_CIPHERTEXT,
                 pt: FIXED_PLAINTEXT,
@@ -670,7 +1009,7 @@ describe('DetokenizeAadhaar command', () => {
         capturedDek = captured;
         const cmdHappy = makeDetokenizeAadhaar(deps);
         await cmdHappy({
-            token: FIXED_TOKEN_ID,
+            challengeId: FIXED_CHALLENGE_ID,
             context: BASE_CONTEXT,
         });
         expect(captured.dek, 'DEK plaintext not captured by fake').toBeDefined();
@@ -680,48 +1019,59 @@ describe('DetokenizeAadhaar command', () => {
         ).toBe(true);
 
         // Throw path 1: unwrap fails.
-        const { deps: depsUnwrapFail, captured: capturedUnwrapFail } = makeDeps({
+        const { deps: depsUnwrapFail } = makeDeps({
             tokens: [makeTokenRow()],
-            identities: [makeIdentityRow()],
             failUnwrap: true,
         });
         const cmdUnwrapFail = makeDetokenizeAadhaar(depsUnwrapFail);
         await expect(
             cmdUnwrapFail({
-                token: FIXED_TOKEN_ID,
+                challengeId: FIXED_CHALLENGE_ID,
                 context: BASE_CONTEXT,
             }),
         ).rejects.toMatchObject({ code: 'UNWRAP_FAILED' });
-        // The fake KeyManager's captured.dek is undefined on the
-        // unwrap-failure path because `unwrapDataKey` throws before
-        // populating it; the safeZero skip-on-undefined branch in
-        // the command covers this case.
 
         // Throw path 2: decrypt fails. The fake KeyManager still
         // records the DEK during a successful unwrap, so we can
         // assert it is zeroed.
-        const { deps: depsDecryptFail, captured: capturedDecryptFail } = makeDeps({
-            tokens: [makeTokenRow()],
-            identities: [makeIdentityRow()],
-            failDecrypt: true,
-        });
+        const { deps: depsDecryptFail, captured: capturedDecryptFail } =
+            makeDeps({
+                tokens: [makeTokenRow()],
+                failDecrypt: true,
+            });
         const cmdDecryptFail = makeDetokenizeAadhaar(depsDecryptFail);
         await expect(
             cmdDecryptFail({
-                token: FIXED_TOKEN_ID,
+                challengeId: FIXED_CHALLENGE_ID,
                 context: BASE_CONTEXT,
             }),
         ).rejects.toMatchObject({ code: 'DECRYPTION_FAILED' });
-        // On the decrypt-fail branch, `dek` was set (unwrap
-        // succeeded) and then the decrypt threw. The command's
-        // finally zeroes it. The fake returned a fresh Buffer
-        // allocation on unwrap, but the command zeros its local
-        // copy. We can't observe the local copy directly here —
-        // we trust that the happy-path afterEach() guard would
-        // catch a leak if the finally didn't run. The explicit
-        // assertion is on the happy path; this assertion confirms
-        // the throw branch did not blow up before reaching
-        // finally.
         expect(capturedDecryptFail.dek).toBeDefined();
+
+        // Throw path 3: challenge not approved. The command never
+        // touches the DEK on this branch; assert the finally
+        // ran without throwing.
+        const { deps: depsNotApproved } = makeDeps({
+            challenges: [
+                makeChallenge({ status: 'pending', approvedAt: null }),
+            ],
+        });
+        const cmdNotApproved = makeDetokenizeAadhaar(depsNotApproved);
+        await expect(
+            cmdNotApproved({
+                challengeId: FIXED_CHALLENGE_ID,
+                context: BASE_CONTEXT,
+            }),
+        ).rejects.toMatchObject({ code: 'CHALLENGE_NOT_APPROVED' });
+
+        // Throw path 4: replay (consume() returns null).
+        const { deps: depsConsumed } = makeDeps({ failConsumeNext: true });
+        const cmdConsumed = makeDetokenizeAadhaar(depsConsumed);
+        await expect(
+            cmdConsumed({
+                challengeId: FIXED_CHALLENGE_ID,
+                context: BASE_CONTEXT,
+            }),
+        ).rejects.toMatchObject({ code: 'CHALLENGE_CONSUMED' });
     });
 });

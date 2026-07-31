@@ -1,6 +1,6 @@
 /**
  * `POST /v1/detokenize` — HTTP surface for the {@link DetokenizeAadhaar}
- * application command (Session 5C).
+ * application command (Session 7E — release step).
  *
  * The route is the only place where the v0.1 partition between
  * application and infrastructure changes direction: the route
@@ -8,7 +8,22 @@
  * `DetokenizeCallerContext`, and asks the command to do the work.
  * The command itself never imports `fastify`.
  *
- * # Auth boundary
+ * # Wire contract (Session 7E)
+ *
+ *   The route now consumes a `challengeId` instead of a raw `token`.
+ *   The challenge is minted by `POST /v1/detokenize/request` and
+ *   transitioned to `approved` by
+ *   `POST /v1/detokenize/step-up/:challengeId/approve`. The body
+ *   must therefore carry `{ challengeId, context }`; the legacy
+ *   `{ token, context }` shape is rejected by the `.strict()` Zod
+ *   schema with a 400.
+ *
+ *   The legacy `token` field is NOT a valid input on this route.
+ *   Token ids can only flow through the challenge row, which means
+ *   anyone holding `vault:detokenize` scope still needs an approved,
+ *   unexpired, unconsumed challenge row to recover plaintext.
+ *
+ * # Auth boundary (unchanged)
  *
  *   1. Caller must present a verified Bearer JWT — supplied by the
  *      Session 5 Phase 1 auth plugin. No token → `401`.
@@ -24,14 +39,22 @@
  *      is used as a fallback so the audit log still has a non-empty
  *      actor.
  *
- * # Status mapping
+ * # Status mapping (Session 7E)
  *
  *   - `200` — plaintext recovered, audit row appended.
- *   - `400` — JSON body failed schema validation.
+ *   - `400` — JSON body failed schema validation (legacy `token`
+ *             field, missing `challengeId`, etc.).
  *   - `401` — missing / malformed / expired / untrusted Bearer.
  *   - `403` — token verified but missing `vault:detokenize`.
- *   - `404` — `TOKEN_NOT_FOUND` or `IDENTITY_NOT_FOUND`.
- *   - `500` — `UNWRAP_FAILED`, `DECRYPTION_FAILED`, anything else.
+ *             OR — `CHALLENGE_NOT_APPROVED`,
+ *                  `CHALLENGE_OPERATION_MISMATCH`,
+ *                  `ACTOR_MISMATCH`.
+ *   - `404` — `CHALLENGE_NOT_FOUND`,
+ *             `TOKEN_NOT_FOUND`, `IDENTITY_NOT_FOUND` (defensive).
+ *   - `409` — `CHALLENGE_CONSUMED` (replay attempt).
+ *   - `410` — `CHALLENGE_EXPIRED`.
+ *   - `500` — `UNWRAP_FAILED`, `DECRYPTION_FAILED`,
+ *             `INVALID_PAYLOAD`, anything else.
  *   - `503` — vault dependencies were not wired before the request
  *             arrived (race during startup).
  *
@@ -44,6 +67,11 @@
  *   handler rebuilds the command inside the request, fetching the
  *   current deps from the server-owned getters; this keeps the
  *   command heap-isolated and matches the tokenize-route pattern.
+ *
+ *   Session 7E extends the same pattern: `stepUpChallenges` is a
+ *   lazy getter sourced from the same `Database` object that
+ *   exposes the tokens / identities / audit repositories, so no
+ *   new wiring site is required.
  *
  * # Schema reconciliation notes (RESOLVED)
  *
@@ -65,6 +93,7 @@ import {
 import type { CryptoService } from '../application/ports/crypto.service.js';
 import type { EventPublisher } from '../application/ports/event-publisher.js';
 import type { KeyManager } from '../application/ports/key-manager.js';
+import type { StepUpChallengeRepository } from '../application/ports/step-up-challenge.repository.js';
 import type { Database } from '../db/index.js';
 import type { Logger } from '../logger.js';
 
@@ -94,9 +123,15 @@ const DetokenizeContextSchema = z
     })
     .strict();
 
+/**
+ * Session 7E — request shape is now `{ challengeId, context }`.
+ *
+ * The legacy `token` field is intentionally absent. `.strict()`
+ * ensures any extra fields (including a stale `token`) cause a 400.
+ */
 const DetokenizeRequestSchema = z
     .object({
-        token: z.string().min(1).max(128),
+        challengeId: z.string().min(1).max(128),
         context: DetokenizeContextSchema,
     })
     .strict();
@@ -105,9 +140,23 @@ const DetokenizeRequestSchema = z
  * Status mapping for {@link DetokenizeCommandError} codes. Anything
  * not in this table is treated as a 500. Deliberately small: every
  * code is documented in the command's file-level comment.
+ *
+ * Session 7E — added the step-up lifecycle mappings:
+ *   - `CHALLENGE_NOT_FOUND`         → 404
+ *   - `CHALLENGE_OPERATION_MISMATCH`→ 403
+ *   - `CHALLENGE_EXPIRED`           → 410
+ *   - `CHALLENGE_NOT_APPROVED`      → 403
+ *   - `CHALLENGE_CONSUMED`          → 409 (replay)
+ *   - `ACTOR_MISMATCH`              → 403
  */
 const ERROR_STATUS: Record<string, number> = {
     INVALID_INPUT: 400,
+    CHALLENGE_NOT_FOUND: 404,
+    CHALLENGE_OPERATION_MISMATCH: 403,
+    CHALLENGE_EXPIRED: 410,
+    CHALLENGE_NOT_APPROVED: 403,
+    CHALLENGE_CONSUMED: 409,
+    ACTOR_MISMATCH: 403,
     TOKEN_NOT_FOUND: 404,
     IDENTITY_NOT_FOUND: 404,
     UNWRAP_FAILED: 500,
@@ -123,6 +172,17 @@ const ERROR_STATUS: Record<string, number> = {
  */
 const ERROR_MESSAGES: Record<string, string> = {
     INVALID_INPUT: 'Request input did not satisfy the detokenization contract.',
+    CHALLENGE_NOT_FOUND:
+        'The supplied challengeId does not match any step-up challenge.',
+    CHALLENGE_OPERATION_MISMATCH:
+        'The challenge does not authorize detokenization.',
+    CHALLENGE_EXPIRED: 'The step-up challenge has expired.',
+    CHALLENGE_NOT_APPROVED:
+        'The step-up challenge has not been approved via MFA yet.',
+    CHALLENGE_CONSUMED:
+        'The step-up challenge has already been consumed (replay attempt).',
+    ACTOR_MISMATCH:
+        'The authenticated principal is not the requester of the challenge.',
     TOKEN_NOT_FOUND: 'The supplied token does not match any vault row.',
     IDENTITY_NOT_FOUND: 'The vault row references a missing identity row.',
     UNWRAP_FAILED: 'Vault encryption key is unavailable.',
@@ -135,8 +195,18 @@ function replyForCommandError(
     err: DetokenizeCommandError,
 ): void {
     const status = ERROR_STATUS[err.code] ?? 500;
+    // The error response shape mirrors the Zod-failure branch
+    // (`{ error, code, message, details? }`) so clients have a
+    // single, consistent contract for every error surfaced by
+    // `POST /v1/detokenize` — regardless of whether it was
+    // produced by Zod (`INVALID_INPUT`) or by the command
+    // itself (`CHALLENGE_NOT_FOUND`, etc.). `error` is the
+    // machine-readable code; `code` is the same value echoed as
+    // a top-level field for callers that prefer flat envelopes;
+    // `message` is a stable, non-leaky human-readable string.
     reply.code(status).send({
         error: err.code,
+        code: err.code,
         message:
             ERROR_MESSAGES[err.code] ?? 'An unexpected error occurred.',
     });
@@ -149,6 +219,14 @@ export interface DetokenizeDeps {
     crypto: () => CryptoService | undefined;
     events: () => EventPublisher | undefined;
     db: () => Database | undefined;
+    /**
+     * Session 7E — the step-up challenge repository. Sourced via the
+     * same lazy-getter seam used by `requestDetokenizationRoutes`
+     * and `stepUpApproveRoutes`. Surfaced on `app.stepUpChallenges`
+     * by `buildServer()` and lazily fetched at request-time so an
+     * unauthenticated DB-less boot does not crash.
+     */
+    challenges: () => StepUpChallengeRepository | undefined;
     logger: Logger;
 }
 
@@ -181,10 +259,38 @@ export const detokenizeRoutes: FastifyPluginAsync<{ deps: DetokenizeDeps }> =
                 return;
             }
 
+            // Session 7E — the StepUpChallengeRepository is fetched
+            // from the Fastify-instance-scoped lazy getter populated
+            // by `buildServer()`. The Database type intentionally
+            // does not expose it (the Repository is wired onto the
+            // app instance, not the database bundle); this mirrors
+            // the seam used by `requestDetokenizationRoutes` and
+            // `stepUpApproveRoutes`. When undefined (DB-less boot)
+            // the route returns 503 — the same defence as every
+            // other DB-backed route in `server.ts`.
+            const challenges = deps.challenges();
+            if (!challenges) {
+                deps.logger.error(
+                    { route: 'POST /v1/detokenize' },
+                    'aadhaar-vault route invoked without step-up challenge repository',
+                );
+                reply.code(503).send({
+                    error: 'service_unavailable',
+                    message: 'Vault not ready.',
+                });
+                return;
+            }
+
             const parsed = DetokenizeRequestSchema.safeParse(req.body);
             if (!parsed.success) {
+                // `code: 'INVALID_INPUT'` is the canonical machine-readable
+                // code that mirrors the application-layer
+                // `DetokenizeCommandError` shape — keeps test contracts and
+                // client error handlers symmetric regardless of whether the
+                // error is caught by Zod (here) or by the command itself.
                 reply.code(400).send({
                     error: 'invalid_request',
+                    code: 'INVALID_INPUT',
                     message: 'Request body failed validation.',
                     details: parsed.error.issues.map((i) => ({
                         path: i.path.join('.'),
@@ -201,6 +307,11 @@ export const detokenizeRoutes: FastifyPluginAsync<{ deps: DetokenizeDeps }> =
             // subject, the body's `actorId` is the fallback. This
             // is the same principal-trust policy documented on
             // `tokenize.routes.ts`.
+            //
+            // Session 7E — this same subject is what the command
+            // compares against `challenge.requestedBy` for actor
+            // binding. A caller with `vault:detokenize` scope
+            // cannot consume a challenge minted by someone else.
             const verifiedSubject = req.principal?.subject;
             const actorId =
                 verifiedSubject && verifiedSubject.length > 0
@@ -215,11 +326,12 @@ export const detokenizeRoutes: FastifyPluginAsync<{ deps: DetokenizeDeps }> =
                 identities: db.identities,
                 audit: db.audit,
                 events,
+                challenges,
             });
 
             try {
                 const result = await command({
-                    token: body.token,
+                    challengeId: body.challengeId,
                     context: {
                         actorId,
                         actorRole,
@@ -249,7 +361,7 @@ export const detokenizeRoutes: FastifyPluginAsync<{ deps: DetokenizeDeps }> =
                             errCode: err.code,
                             actorId,
                             actorRole,
-                            token: body.token,
+                            challengeId: body.challengeId,
                             reqId: req.id,
                         },
                         'aadhaar-vault detokenize rejected',

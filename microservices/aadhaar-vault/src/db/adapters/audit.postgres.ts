@@ -42,15 +42,16 @@ function mapRow(row: AuditRow): AuditRecord {
 export class PostgresAuditRepository implements AuditRepository {
     constructor(private readonly runner: QueryRunner) {}
 
-    async append(entry: AuditEntry): Promise<void> {
+    async append(entry: AuditEntry): Promise<number> {
         // Application-supplied timestamp so that the same `pg-mem` test
         // harness that runs the migration also runs the repositories.
         // See the note at the top of `001_initial_schema.sql`.
         const occurredAt = new Date();
-        await this.runner.query(
+        const { rows } = await this.runner.query<{ audit_id: number }>(
             `INSERT INTO vault_audit_log
                 (identity_id, actor, action, outcome, reason, request_id, occurred_at, meta)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+             RETURNING audit_id`,
             [
                 entry.identityId,
                 entry.actor,
@@ -62,6 +63,13 @@ export class PostgresAuditRepository implements AuditRepository {
                 JSON.stringify(entry.meta ?? {}),
             ],
         );
+        const row = rows[0];
+        if (!row) {
+            throw new Error(
+                'PostgresAuditRepository.append: INSERT did not RETURN a row.',
+            );
+        }
+        return row.audit_id;
     }
 
     async listByIdentity(

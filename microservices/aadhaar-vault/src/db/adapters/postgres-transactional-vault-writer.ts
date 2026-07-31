@@ -73,7 +73,11 @@ export class PostgresTransactionalVaultWriter
                 insertToken: (token) =>
                     new PostgresTokenRepository(client).insert(token),
                 appendAudit: (entry) =>
-                    new PostgresAuditRepository(client).append(entry),
+                    new PostgresAuditRepository(client)
+                        .append(entry)
+                        .then(
+                            () => undefined,
+                        ),
             };
             try {
                 const result = await work(conn);

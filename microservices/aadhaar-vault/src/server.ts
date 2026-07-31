@@ -40,11 +40,16 @@ import { tokenizeRoutes } from './routes/tokenize.routes.js';
 import { detokenizeRoutes } from './routes/detokenize.routes.js';
 import { auditRoutes } from './routes/audit.routes.js';
 import { mfaRoutes } from './routes/mfa.routes.js';
+import { requestDetokenizationRoutes } from './routes/request-detokenization.routes.js';
+import { stepUpApproveRoutes } from './routes/step-up.routes.js';
 
 import { createKeyManager } from './infrastructure/key-providers/index.js';
+import { PostgresStepUpChallengeRepository } from './infrastructure/db/postgres-step-up-challenge.repository.js';
+import { MemoryStepUpChallengeRepository } from './infrastructure/db/memory-step-up-challenge.repository.js';
 import type { KeyManager } from './application/ports/key-manager.js';
 import type { CryptoService } from './application/ports/crypto.service.js';
 import type { EventPublisher } from './application/ports/event-publisher.js';
+import type { StepUpChallengeRepository } from './application/ports/step-up-challenge.repository.js';
 import type { TransactionalVaultWriter } from './application/ports/transactional-vault-writer.js';
 import type { JwtVerifier } from './application/ports/jwt-verifier.js';
 import type { TotpVerifier } from './application/ports/totp-verifier.js';
@@ -114,6 +119,15 @@ declare module 'fastify' {
     crypto?: CryptoService;
     events?: EventPublisher;
     /**
+     * Step-up challenge repository backing the
+     * `POST /v1/detokenize/request` route. Set iff a DB (or a DB
+     * override) was wired at boot — Postgres in production, the
+     * in-memory Map adapter in tests / dev consoles. Surfaced
+     * through the same `app.*` fastify-decoration seam as every
+     * other cross-cutting port.
+     */
+    stepUpChallenges?: StepUpChallengeRepository;
+    /**
      * Convenience reference to `db?.vaultWriter`. Set iff `db` is set.
      * Surfaced so the route module can address it through the same
      * `app.*` fastify-decoration seam as everything else.
@@ -169,6 +183,23 @@ export async function buildServer(
     app.db = await createDatabase({ uri: config.VAULT_DB_URI, logger });
   } else if (config.NODE_ENV === 'test') {
     app.db = await createMemoryDatabase();
+  }
+
+  // Wire the step-up challenge repository. Mirrors the DB selection
+  // logic above: real Postgres in production (migration 004 declares
+  // `vault_step_up_challenges` against the same pool as the rest of
+  // the vault tables), the in-memory Map adapter whenever we are on
+  // a non-Postgres boot path (MemoryPool does not declare the
+  // step-up table, so a Postgres adapter against it would crash on
+  // first query). The repository is left undefined when no DB was
+  // wired at all, and the route reports 503 — the same defence as
+  // every other DB-backed route in this file.
+  if (config.VAULT_DB_URI && app.db) {
+    app.stepUpChallenges = new PostgresStepUpChallengeRepository(
+      app.db.pool,
+    );
+  } else if (app.db) {
+    app.stepUpChallenges = new MemoryStepUpChallengeRepository();
   }
 
   // Wire the KeyManager. Explicit override wins; otherwise the factory
@@ -398,6 +429,14 @@ export async function buildServer(
   // Register the detokenize route. Same dependency shape as the
   // tokenize route, but the route does not need the vault writer
   // (detokenize is a read + audit-append, not a multi-row write).
+  //
+  // Session 7E — the route now consumes a StepUpChallengeRepository.
+  // The repository is wired onto the Fastify instance during boot
+  // (see `app.stepUpChallenges` block above); the route receives it
+  // through the same `() => app.stepUpChallenges` lazy-getter seam
+  // used by `requestDetokenizationRoutes` and `stepUpApproveRoutes`.
+  // This is the ONLY place the route registration was extended for
+  // Session 7E — no other wiring changed.
   await app.register(detokenizeRoutes, {
     deps: {
       version: '0.1.0',
@@ -405,6 +444,52 @@ export async function buildServer(
       crypto: () => app.crypto,
       events: () => app.events,
       db: () => app.db,
+      challenges: () => app.stepUpChallenges,
+      logger,
+    },
+  });
+  // Register the request-detokenization (step-up) route. Minting a
+  // challenge row does not require the key manager or the crypto
+  // service (no envelope is unwrapped here), so this plugin's dep
+  // shape is intentionally narrower than `detokenizeRoutes`. The
+  // step-up challenge repository is wired onto the Fastify instance
+  // during boot (see `app.stepUpChallenges` block above); the
+  // server-side getter is exposed through the same `app.*` lazy
+  // seam every other cross-cutting port uses. The route is gated by
+  // the same `vault:detokenize` scope as the plaintext-release
+  // route — the step-up is a preamble to the actual release, not a
+  // distinct authorisation domain.
+  await app.register(requestDetokenizationRoutes, {
+    deps: {
+      version: '0.1.0',
+      db: () => app.db,
+      events: () => app.events,
+      challenges: () => app.stepUpChallenges,
+      logger,
+    },
+  });
+
+  // Register the step-up approval route. Flips the challenge row
+  // minted by `requestDetokenizationRoutes` from `pending` to
+  // `approved`, but does NOT release plaintext — that still goes
+  // through the existing `detokenizeRoutes`. The route depends on the
+  // key manager (to unwrap the MFA shared secret), the TOTP verifier
+  // (to validate the typed code), the MFA repository (to load the
+  // factor referenced by the challenge), the step-up challenge
+  // repository (to flip the row), the audit repository (to record the
+  // approval), and the event publisher (to broadcast
+  // `StepUpChallengeApproved`). The route is gated by the same
+  // `vault:detokenize` scope as the rest of the workflow; the JWT
+  // subject is the trusted `actorId`. The deps mirror the shape used
+  // by `mfaRoutes` so the two endpoints share the same wiring pattern.
+  await app.register(stepUpApproveRoutes, {
+    deps: {
+      version: '0.1.0',
+      keyManager: () => app.keyManager,
+      totp: () => app.totpVerifier,
+      db: () => app.db,
+      events: () => app.events,
+      challenges: () => app.stepUpChallenges,
       logger,
     },
   });
