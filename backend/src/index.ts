@@ -8,10 +8,12 @@ import { generateAIDiagnostic, evaluateAIDiagnostic, generateAIPersonalizedWorks
 import { generateDiagnosticPaper } from './paperGenerator';
 import { generateQuestionsForLevel } from './levelGenerator';
 import * as levelsBackendClient from './levelsBackendClient';
+import { STATES_UTS } from './geoData';
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import rateLimit from 'express-rate-limit';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -35,6 +37,15 @@ function sanitizeUser(user: User): Omit<User, 'passwordHash'> {
   const { passwordHash, ...safe } = user;
   return safe;
 }
+
+// Throttle auth endpoints to slow down brute-force / credential-stuffing attempts.
+const authRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Please try again later.' },
+});
 
 async function startServer() {
   // Connect to MongoDB
@@ -68,6 +79,28 @@ async function startServer() {
     if (!payload?.email) return null;
 
     return dbStore.getUserSync(payload.email);
+  }
+
+  // Authorization check for by-ID student endpoints (PATCH/diagnostic/diagnostic-submit).
+  // Mirrors the scoping already applied to GET /api/students' list filtering, so a
+  // teacher/volunteer/school user can't act on a student outside their own school(s)
+  // by guessing/enumerating IDs (IDOR). Superadmin/state/district/block admins keep
+  // their existing broad access — restricting THAT scope is a separate, tracked fix.
+  function canAccessStudent(user: User, student: Student): boolean {
+    switch (user.role) {
+      case UserRole.SUPERADMIN:
+      case UserRole.ADMIN:
+      case UserRole.DISTRICT_ADMIN:
+      case UserRole.BLOCK_ADMIN:
+        return true;
+      case UserRole.SCHOOL:
+      case UserRole.TEACHER:
+        return student.schoolId === user.schoolId;
+      case UserRole.VOLUNTEER:
+        return user.assignedSchools?.includes(student.schoolId) ?? false;
+      default:
+        return false;
+    }
   }
 
   // --- API Endpoints ---
@@ -105,18 +138,10 @@ async function startServer() {
   });
 
   // Auth: Login
-  app.post('/api/auth/login', async (req, res) => {
+  app.post('/api/auth/login', authRateLimiter, async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required.' });
-    }
-
-    // Verify Password Rules (§3.2 A-3)
-    const hasUppercase = /[A-Z]/.test(password);
-    const hasNumber = /[0-9]/.test(password);
-    const hasSpecial = /[!@#$%^&*(),.?":{}|<>]/.test(password);
-    if (password.length < 8 || !hasUppercase || !hasNumber || !hasSpecial) {
-      return res.status(400).json({ error: 'Password does not meet complexity requirements.' });
     }
 
     // Check if the user is preloaded
@@ -322,6 +347,105 @@ async function startServer() {
     res.json(newUser);
   });
 
+  // Coordinator registration: state -> district -> block -> school cascade, then
+  // creating a teacher account scoped to the chosen school.
+  const COORDINATOR_ROLES = [UserRole.SUPERADMIN, UserRole.ADMIN, UserRole.DISTRICT_ADMIN, UserRole.BLOCK_ADMIN];
+
+  app.get('/api/states', (_req, res) => {
+    res.json(STATES_UTS.map(s => ({ id: s.code, name: s.name })));
+  });
+
+  app.get('/api/districts/by-state/:stateId', (req, res) => {
+    const state = STATES_UTS.find(s => s.code.toLowerCase() === req.params.stateId.toLowerCase());
+    if (!state) return res.status(404).json({ error: 'Unknown state.' });
+    res.json(state.districts.map(d => ({ id: d.code, name: d.name })));
+  });
+
+  app.get('/api/blocks/by-district/:districtId', async (req, res) => {
+    const districtCode = req.params.districtId.toUpperCase();
+    const district = STATES_UTS.flatMap(s => s.districts).find(d => d.code === districtCode);
+    if (!district) return res.status(404).json({ error: 'Unknown district.' });
+
+    const schools = await dbStore.getSchools();
+    const blockCodes = Array.from(new Set(
+      schools.filter(s => s.districtCode === districtCode).map(s => s.blockCode)
+    )).sort();
+
+    res.json(blockCodes.map(code => {
+      const blockNum = parseInt(code.split('_').pop() || '0', 10);
+      return { id: code, name: `${district.name} Block ${blockNum}`, districtId: districtCode };
+    }));
+  });
+
+  app.get('/api/schools/by-block/:blockId', async (req, res) => {
+    const blockCode = req.params.blockId.toUpperCase();
+    const schools = await dbStore.getSchools();
+    res.json(schools.filter(s => s.blockCode === blockCode));
+  });
+
+  app.post('/api/teachers', async (req, res) => {
+    const user = getAuthUser(req);
+    if (!user || !COORDINATOR_ROLES.includes(user.role)) {
+      return res.status(403).json({ error: 'Forbidden. Coordinator role required.' });
+    }
+
+    const { firstName, lastName, email, phoneNumber, password, school } = req.body;
+    if (!firstName || !lastName || !email || !password || !school) {
+      return res.status(400).json({ error: 'Missing required fields.' });
+    }
+
+    const hasUppercase = /[A-Z]/.test(password);
+    const hasNumber = /[0-9]/.test(password);
+    const hasSpecial = /[!@#$%^&*(),.?":{}|<>]/.test(password);
+    if (password.length < 8 || !hasUppercase || !hasNumber || !hasSpecial) {
+      return res.status(400).json({ error: 'Password does not meet complexity requirements. Must be >= 8 chars and contain uppercase, digit, and special char.' });
+    }
+
+    const schools = await dbStore.getSchools();
+    const targetSchool = schools.find(s => s.id.toLowerCase() === String(school).toLowerCase());
+    if (!targetSchool) return res.status(400).json({ error: 'Unknown school.' });
+
+    const users = await dbStore.getUsers();
+    if (users.some(u => u.email.toLowerCase() === email.toLowerCase())) {
+      return res.status(400).json({ error: 'User with this email already exists.' });
+    }
+
+    const teacherId = 'u_' + Math.random().toString(36).substr(2, 9);
+    const newTeacher: User = {
+      id: teacherId,
+      name: `${firstName} ${lastName}`,
+      email: email.toLowerCase(),
+      role: UserRole.TEACHER,
+      passwordHash: await bcrypt.hash(password, 10),
+      phoneNumber: phoneNumber || undefined,
+      stateCode: targetSchool.stateCode,
+      districtCode: targetSchool.districtCode,
+      blockCode: targetSchool.blockCode,
+      schoolId: targetSchool.id,
+    };
+
+    await dbStore.addUser(newTeacher);
+
+    await dbStore.addLog({
+      id: 'log_' + Date.now(),
+      timestamp: new Date().toISOString(),
+      schoolId: targetSchool.id,
+      schoolName: targetSchool.name,
+      userId: user.id,
+      userEmail: user.email,
+      userRole: user.role,
+      activityType: 'verify',
+      status: 'Success',
+      details: `Coordinator registered teacher: ${newTeacher.name} at ${targetSchool.name}`,
+    });
+
+    res.json({
+      success: true,
+      message: 'Teacher registered successfully.',
+      data: { teacherId, firstName, lastName, email: newTeacher.email },
+    });
+  });
+
   // Schools
   app.get('/api/schools', async (req, res) => {
     const schools = await dbStore.getSchools();
@@ -393,13 +517,23 @@ async function startServer() {
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
 
     const students = await dbStore.getStudents();
-    
-    // Mask Aadhar for non-Superadmins (§13.2 R-6)
+
+    // Roles with a direct, day-to-day relationship to the child (and superadmin)
+    // see full contact/address PII; aggregate-scope admins and volunteers get it
+    // redacted — they don't need a guardian's phone number to view rollups.
+    const canSeeGuardianPII = (role: UserRole) =>
+      role === UserRole.SUPERADMIN || role === UserRole.SCHOOL || role === UserRole.TEACHER;
+
+    // Mask Aadhar for non-Superadmins (§13.2 R-6); redact guardian contact/address similarly.
     const maskedStudents = students.map(s => {
-      if (user.role !== UserRole.SUPERADMIN) {
-        return { ...s, aadharMasked: 'XXXX-XXXX-' + s.aadharMasked.slice(-4) };
+      const masked = user.role !== UserRole.SUPERADMIN
+        ? { ...s, aadharMasked: 'XXXX-XXXX-' + s.aadharMasked.slice(-4) }
+        : { ...s };
+      if (!canSeeGuardianPII(user.role)) {
+        delete masked.guardianContact;
+        delete masked.address;
       }
-      return s;
+      return masked;
     });
 
     if (user.role === UserRole.SUPERADMIN) {
@@ -411,6 +545,19 @@ async function startServer() {
     if (user.role === UserRole.VOLUNTEER) {
       return res.json(maskedStudents.filter(s => user.assignedSchools?.includes(s.schoolId)));
     }
+    if (user.role === UserRole.ADMIN || user.role === UserRole.DISTRICT_ADMIN || user.role === UserRole.BLOCK_ADMIN) {
+      // Geo-scope by the admin's own state/district/block, joined via each student's school.
+      const schools = await dbStore.getSchools();
+      const schoolById = new Map(schools.map(sc => [sc.id, sc]));
+      const geoFiltered = maskedStudents.filter(s => {
+        const school = schoolById.get(s.schoolId);
+        if (!school) return false;
+        if (user.role === UserRole.ADMIN) return school.stateCode === user.stateCode;
+        if (user.role === UserRole.DISTRICT_ADMIN) return school.districtCode === user.districtCode;
+        return school.blockCode === user.blockCode; // BLOCK_ADMIN
+      });
+      return res.json(geoFiltered);
+    }
 
     res.json(maskedStudents);
   });
@@ -420,7 +567,11 @@ async function startServer() {
     const user = getAuthUser(req);
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { name, age, classGroup, section, schoolId, aadharNumber } = req.body;
+    const {
+      name, age, classGroup, section, schoolId, aadharNumber,
+      gender, dob, guardianName, guardianRelation, guardianContact, address,
+      bloodGroup, disabilityStatus, midDayMealBeneficiary, busRoute, siblingsInSchool,
+    } = req.body;
     if (!name || !age || !classGroup || !section || !schoolId || !aadharNumber) {
       return res.status(400).json({ error: 'Missing required student details.' });
     }
@@ -451,7 +602,18 @@ async function startServer() {
       targetLevel: 2,
       aadharMasked: rawAadhar, // Store raw unmasked Aadhar in DB so Superadmin sees it, others get masked dynamically
       levelHistory: [],
-      streak: 0
+      streak: 0,
+      gender: gender || undefined,
+      dob: dob || undefined,
+      guardianName: guardianName || undefined,
+      guardianRelation: guardianRelation || undefined,
+      guardianContact: guardianContact || undefined,
+      address: address || undefined,
+      bloodGroup: bloodGroup || undefined,
+      disabilityStatus: disabilityStatus || undefined,
+      midDayMealBeneficiary: midDayMealBeneficiary === undefined ? undefined : Boolean(midDayMealBeneficiary),
+      busRoute: busRoute || undefined,
+      siblingsInSchool: siblingsInSchool || undefined,
     };
 
     await dbStore.addStudent(newStudent);
@@ -481,6 +643,7 @@ async function startServer() {
     const students = await dbStore.getStudents();
     const student = students.find(s => s.id === req.params.id);
     if (!student) return res.status(404).json({ error: 'Student not found.' });
+    if (!canAccessStudent(user, student)) return res.status(403).json({ error: 'Forbidden.' });
 
     await dbStore.updateStudent(student.id, {
       currentLevel: Number(currentLevel),
@@ -488,6 +651,42 @@ async function startServer() {
       targetLevel: Number(targetLevel),
       levelHistory: levelHistory || student.levelHistory
     });
+
+    res.json({ success: true });
+  });
+
+  // Update Student Profile (guardian/medical/logistics fields) — only the
+  // student's own school/teacher, or higher admins, may edit; kept separate
+  // from the level-update PATCH above so neither contract has to change.
+  app.patch('/api/students/:id/profile', async (req, res) => {
+    const user = getAuthUser(req);
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const students = await dbStore.getStudents();
+    const student = students.find(s => s.id === req.params.id);
+    if (!student) return res.status(404).json({ error: 'Student not found.' });
+    if (!canAccessStudent(user, student)) return res.status(403).json({ error: 'Forbidden.' });
+
+    const {
+      gender, dob, guardianName, guardianRelation, guardianContact, address,
+      bloodGroup, disabilityStatus, midDayMealBeneficiary, busRoute, siblingsInSchool, teacherNotes,
+    } = req.body;
+
+    const updates: Partial<Student> = {};
+    if (gender !== undefined) updates.gender = gender;
+    if (dob !== undefined) updates.dob = dob;
+    if (guardianName !== undefined) updates.guardianName = guardianName;
+    if (guardianRelation !== undefined) updates.guardianRelation = guardianRelation;
+    if (guardianContact !== undefined) updates.guardianContact = guardianContact;
+    if (address !== undefined) updates.address = address;
+    if (bloodGroup !== undefined) updates.bloodGroup = bloodGroup;
+    if (disabilityStatus !== undefined) updates.disabilityStatus = disabilityStatus;
+    if (midDayMealBeneficiary !== undefined) updates.midDayMealBeneficiary = Boolean(midDayMealBeneficiary);
+    if (busRoute !== undefined) updates.busRoute = busRoute;
+    if (siblingsInSchool !== undefined) updates.siblingsInSchool = siblingsInSchool;
+    if (teacherNotes !== undefined) updates.teacherNotes = teacherNotes;
+
+    await dbStore.updateStudent(student.id, updates);
 
     res.json({ success: true });
   });
@@ -500,6 +699,7 @@ async function startServer() {
     const students = await dbStore.getStudents();
     const student = students.find(s => s.id === req.params.id);
     if (!student) return res.status(404).json({ error: 'Student not found.' });
+    if (!canAccessStudent(user, student)) return res.status(403).json({ error: 'Forbidden.' });
 
     // Parse class number from classGroup (e.g. "Class 2" -> 2)
     const classMatch = student.classGroup.match(/\d+/);
@@ -595,13 +795,33 @@ async function startServer() {
     const students = await dbStore.getStudents();
     const student = students.find(s => s.id === req.params.id);
     if (!student) return res.status(404).json({ error: 'Student not found.' });
+    if (!canAccessStudent(user, student)) return res.status(403).json({ error: 'Forbidden.' });
 
     // Parse class number from classGroup (e.g. "Class 2" -> 2)
     const classMatch = student.classGroup.match(/\d+/);
     const classNumber = classMatch ? parseInt(classMatch[0], 10) : 1;
 
-    // Connect to Python Evaluation Metrics Pipeline
     const dateStr = new Date().toISOString().split('T')[0];
+
+    // Idempotency: if this student's diagnostic was already submitted and
+    // evaluated today (e.g. a client retry after a timeout), return that
+    // existing report instead of re-running the pipeline and re-appending to
+    // level history. A genuinely new diagnostic on a later date still runs
+    // normally (legitimate re-assessment, not a duplicate retry).
+    const existingReports = await dbStore.getEvaluationReports();
+    const existingReport = existingReports.find(r =>
+      r.worksheetId === 'diagnostic' && r.studentId === student.id && r.timestamp.startsWith(dateStr)
+    );
+    if (existingReport) {
+      return res.json({
+        student,
+        evaluation: { score: existingReport.score, recommendedLevel: existingReport.recommendedLevel, narrative: existingReport.narrative },
+        report: existingReport,
+        alreadySubmitted: true
+      });
+    }
+
+    // Connect to Python Evaluation Metrics Pipeline
     const pipelineDir = AI_SERVICES_DIR;
     const responseDir = path.join(pipelineDir, 'student_responses', `class_${classNumber}`, 'phrase_1');
     fs.mkdirSync(responseDir, { recursive: true });
@@ -1232,6 +1452,31 @@ async function startServer() {
     const students = await dbStore.getStudents();
     const student = students.find(s => s.id === studentId);
     if (!student) return res.status(404).json({ error: 'Student not found.' });
+
+    // Idempotency: a student can only submit a given worksheet once. If this
+    // exact (worksheetId, studentId) pair was already submitted (e.g. the
+    // client retried after a timeout), return the existing result instead of
+    // re-running the AI evaluation, re-mutating the student's level/streak,
+    // and re-appending to level history / delay logs.
+    const existingSubmissions = await dbStore.getAnswerSubmissions();
+    const existingSubmission = existingSubmissions.find(s => s.worksheetId === worksheetId && s.studentId === studentId);
+    if (existingSubmission) {
+      const existingReports = await dbStore.getEvaluationReports();
+      const existingReport = existingReports
+        .filter(r => r.worksheetId === worksheetId && r.studentId === studentId)
+        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0];
+      return res.json({
+        submission: existingSubmission,
+        report: existingReport,
+        evaluation: existingReport ? {
+          score: existingReport.score,
+          recommendedLevel: existingReport.recommendedLevel,
+          narrative: existingReport.narrative,
+          conceptMastery: existingReport.conceptMastery
+        } : undefined,
+        alreadySubmitted: true
+      });
+    }
 
     // Handle Timings & Delayed Attempt Escalation (§6.5)
     const now = new Date();

@@ -16,6 +16,7 @@
 7. [Mint a JWT and call the API](#7-mint-a-jwt-and-call-the-api)
 8. [Environment variables reference](#8-environment-variables-reference)
 9. [Smoke tests / verification](#9-smoke-tests--verification)
+9a. [Step-Up detokenization walkthrough](#9a-step-up-detokenization-walkthrough)
 10. [Production build & Docker image](#10-production-build--docker-image)
 11. [Troubleshooting](#11-troubleshooting)
 12. [URL reference](#12-url-reference)
@@ -250,14 +251,58 @@ TOKEN=$(node -e "
 echo "$TOKEN"
 ```
 
-### 7.2 Hit `/health` (public)
+### 7.2 Feed the console Settings page
+
+The console is not a username/password login screen. Secure routes are authorized by the Bearer JWT you paste into Settings, and request bodies use the actor fields you configure there.
+
+Open:
+
+```text
+http://localhost:4101/console/index.html#settings
+```
+
+Use these values:
+
+| Field | Value |
+|---|---|
+| Vault base URL | `http://localhost:4101` |
+| Bearer token (HS256 JWT) | paste `$TOKEN` from above, without the `Bearer ` prefix |
+| Default actor ID | `tester-001` |
+| Default actor role | `TEACHER` |
+| Use mock when API unreachable | unchecked when testing the real service |
+
+If you want one console token that can call every current secure route, mint it with all vault scopes:
+
+```bash
+TOKEN=$(node -e "
+  const c = require('crypto');
+  const secret = process.env.SERVICE_JWT_HMAC_SECRET;
+  const header = Buffer.from(JSON.stringify({alg:'HS256',typ:'JWT'})).toString('base64url');
+  const now = Math.floor(Date.now()/1000);
+  const payload = Buffer.from(JSON.stringify({
+    iss: 'local-issuer',
+    sub: 'tester-001',
+    aud: 'aadhaar-vault',
+    iat: now,
+    nbf: now,
+    exp: now + 3600,
+    scope: 'vault:tokenize vault:detokenize vault:mfa:enroll vault:mfa:verify vault:audit'
+  })).toString('base64url');
+  const sig = c.createHmac('sha256', secret).update(header + '.' + payload).digest('base64url');
+  console.log(header + '.' + payload + '.' + sig);
+")
+```
+
+After saving Settings, the Tokenize, Detokenize, MFA, and Audit screens will send `Authorization: Bearer <token>` automatically.
+
+### 7.3 Hit `/health` (public)
 
 ```bash
 curl http://localhost:3000/health
 # {"status":"ok"}
 ```
 
-### 7.3 Hit `/v1/tokenize` (auth + scope required)
+### 7.4 Hit `/v1/tokenize` (auth + scope required)
 
 ```bash
 curl -X POST http://localhost:3000/v1/tokenize \
@@ -284,7 +329,7 @@ Expected `201`:
 }
 ```
 
-### 7.4 Common error shapes
+### 7.5 Common error shapes
 
 - `401` no/invalid token: `{"error":"unauthorized","message":"...","code":"token_expired"}` (or `token_missing`, `token_malformed`, `signature_invalid`, `issuer_mismatch`, `audience_mismatch`, `claim_missing`, `unsupported_algorithm`).
 - `403` missing scope: `{"error":"forbidden","message":"Missing required scope: vault:tokenize"}`.
@@ -350,7 +395,7 @@ Mint a token with `scope: ""` (or some other scope). Same body. Expect 403.
 
 ### 9.5 Full round-trip
 
-See §7.3 above.
+See §7.4 above.
 
 ### 9.6 Type-check
 
@@ -427,8 +472,184 @@ If a fix isn't here — open an issue or ask the team before guessing on anythin
 | Liveness | `GET http://localhost:3000/health` | none | k8s liveness probe |
 | Readiness | `GET http://localhost:3000/health/ready` | none | k8s readiness probe; reports `postgres` + `keyProvider` |
 | Tokenise | `POST http://localhost:3000/v1/tokenize` | `Bearer <jwt>` + `vault:tokenize` | mint a token for an identity |
+| MFA enroll | `POST http://localhost:3000/v1/mfa/enroll` | `Bearer <jwt>` + `vault:mfa:enroll` | register a TOTP factor for an actor |
+| Request detokenization | `POST http://localhost:3000/v1/detokenize/request` | `Bearer <jwt>` + `vault:detokenize` | mint a step-up challenge |
+| Verify MFA | `POST http://localhost:3000/v1/mfa/verify` | `Bearer <jwt>` + `vault:mfa:verify` | approve a step-up challenge |
+| Detokenize (Step-Up) | `POST http://localhost:3000/v1/detokenize` | `Bearer <jwt>` + `vault:detokenize` | consume a challenge, return plaintext |
+| Audit | `GET http://localhost:3000/v1/audit` | `Bearer <jwt>` + `vault:audit:read` | read recent audit events |
 
-Not yet exposed (design settled, route deferred): `GET /v1/lookup`, `DELETE /v1/token/:id`, `POST /v1/mfa/enroll`, `POST /v1/mfa/verify`.
+See [§9a](#9a-step-up-detokenization-walkthrough) for the full Step-Up walkthrough and [STEP_UP_AUTH.md](./STEP_UP_AUTH.md) for the threat model.
+
+---
+
+## 9a. Step-Up detokenization walkthrough
+
+Detokenization requires an active, MFA-approved step-up challenge. The three-call
+sequence is intentionally split so that **plaintext Aadhaar never travels
+without a fresh human approval**.
+
+### 9a.1 Mint a one-time token + challenge token
+
+The full token must include all the scopes used in this section:
+
+```bash
+TOKEN=$(node -e "
+  const c = require('crypto');
+  const secret = process.env.SERVICE_JWT_HMAC_SECRET;
+  const header = Buffer.from(JSON.stringify({alg:'HS256',typ:'JWT'})).toString('base64url');
+  const now = Math.floor(Date.now()/1000);
+  const payload = Buffer.from(JSON.stringify({
+    iss: 'local-issuer',
+    sub: 'tester-001',
+    aud: 'aadhaar-vault',
+    iat: now, nbf: now, exp: now + 3600,
+    scope: 'vault:tokenize vault:detokenize vault:mfa:enroll vault:mfa:verify vault:audit:read'
+  })).toString('base64url');
+  const sig = c.createHmac('sha256', secret).update(header + '.' + payload).digest('base64url');
+  console.log(header + '.' + payload + '.' + sig);
+")
+```
+
+### 9a.2 Tokenise an Aadhaar number
+
+```bash
+TOKENISE=$(curl -s -X POST http://localhost:3000/v1/tokenize \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "aadhaar": "998877665544",
+    "identityType": "AADHAAR",
+    "context": {
+      "actorId":   "tester-001",
+      "actorRole": "SUPER_ADMIN",
+      "reason":    "onboarding"
+    }
+  }')
+
+VID=$(echo "$TOKENISE" | jq -r .token)
+```
+
+### 9a.3 Enrol an MFA factor (TOTP)
+
+```bash
+ENROL=$(curl -s -X POST http://localhost:3000/v1/mfa/enroll \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "actor":   "tester-001",
+    "role":    "SUPER_ADMIN",
+    "context": { "actorId": "tester-001", "actorRole": "SUPER_ADMIN", "reason": "step-up enroll" }
+  }')
+
+FACTOR_ID=$(echo "$ENROL"  | jq -r .factorId)
+SECRET=$(echo "$ENROL"      | jq -r .otpauthUri | sed -E 's/.*secret=([A-Z2-7]+).*/\1/')
+echo "factor=$FACTOR_ID secret=$SECRET"
+```
+
+### 9a.4 Request a detokenization challenge
+
+```bash
+REQ=$(curl -s -X POST http://localhost:3000/v1/detokenize/request \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"token\":             \"$VID\",
+    \"requiredFactorId\":  \"$FACTOR_ID\",
+    \"context\": {
+      \"actorId\":   \"tester-001\",
+      \"actorRole\": \"SUPER_ADMIN\",
+      \"reason\":    \"step-up request\"
+    }
+  }")
+
+CHALLENGE_ID=$(echo "$REQ" | jq -r .challengeId)
+EXPIRES=$(echo "$REQ"      | jq -r .expiresAt)
+echo "challenge=$CHALLENGE_ID expires=$EXPIRES"
+```
+
+### 9a.5 Compute the TOTP code and verify MFA
+
+The vault uses RFC 6238 SHA-1 TOTP, 6 digits, 30-second period. A reference
+implementation in plain Node:
+
+```bash
+CODE=$(node -e "
+  const { createHmac } = require('crypto');
+  const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const sec  = '$SECRET'.toUpperCase().replace(/=+\$/g,'');
+  let bits = ''; for (const ch of sec) bits += B32.indexOf(ch).toString(2).padStart(5,'0');
+  const buf = Buffer.alloc(8); buf.writeBigUInt64BE(BigInt(Math.floor(Date.now()/30000)));
+  const key = Buffer.from(bits.match(/.{8}/g).map(b => parseInt(b,2)));
+  const h   = createHmac('sha1', key).update(buf).digest();
+  const o   = h[h.length-1] & 0x0f;
+  const code = ((h[o]&0x7f)<<24) | ((h[o+1]&0xff)<<16) | ((h[o+2]&0xff)<<8) | (h[o+3]&0xff);
+  console.log(String(code % 1_000_000).padStart(6,'0'));
+")
+
+curl -s -X POST http://localhost:3000/v1/mfa/verify \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"challengeId\": \"$CHALLENGE_ID\",
+    \"factorId\":    \"$FACTOR_ID\",
+    \"code\":        \"$CODE\",
+    \"reason\":      \"approved\"
+  }"
+# → { "verified": true, "failureReason": null, "delta": 0 }
+```
+
+### 9a.6 Detokenize (consume the challenge)
+
+```bash
+curl -s -X POST http://localhost:3000/v1/detokenize \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"challengeId\": \"$CHALLENGE_ID\",
+    \"context\": {
+      \"actorId\":   \"tester-001\",
+      \"actorRole\": \"SUPER_ADMIN\",
+      \"reason\":    \"onboarding look-up\"
+    }
+  }"
+# → { "token": "…", "identityId": 1, "aadhaar": "998877665544", "last4": "5544", "auditId": 7 }
+```
+
+### 9a.7 Replay (must be rejected)
+
+```bash
+curl -i -X POST http://localhost:3000/v1/detokenize \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{ \"challengeId\": \"$CHALLENGE_ID\", \"context\": { ... } }"
+# → HTTP/1.1 409 Conflict
+# → { "error": "challenge_consumed", ... }   (NEVER the plaintext again)
+```
+
+### 9a.8 End-to-end script
+
+The repository also ships a self-contained walkthrough that boots the server,
+runs every assertion, and exits non-zero on the first failure:
+
+```bash
+npm run smoke:stepup
+```
+
+This replaces the legacy `npm run smoke:probe` walkthrough. It exercises the
+real HTTP surface (`fetch` against `http://localhost:4101`) and asserts:
+
+- tokenize succeeds
+- challenge request succeeds
+- MFA verify approves the challenge
+- detokenize returns the plaintext exactly once
+- replaying the same `challengeId` returns `409 CHALLENGE_CONSUMED`
+- an expired challenge returns `410 CHALLENGE_EXPIRED`
+- a different actor's JWT is rejected with `403`
+- exactly one `DETOKENIZE` audit row is appended
+- exactly one `StepUpChallengeCompleted` event is published
+
+See [STEP_UP_AUTH.md](./STEP_UP_AUTH.md) for the threat model and the
+challenge state-machine documentation.
 
 ---
 

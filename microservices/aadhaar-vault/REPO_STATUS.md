@@ -1,9 +1,9 @@
 # REPO_STATUS.md — Repository Snapshot
 
-> **Snapshot taken:** 24 Jul 2026, after Session 5 Phase 2 (MFA factor model + TOTP verifier).
+> **Snapshot taken:** 27 Jul 2026, after Session 6D (audit + MFA HTTP routes).
 > **Branch under audit:** `feature/aadhaar-vault`, tracking `origin/feature/aadhaar-vault` (upstream set via `git push -u origin feature/aadhaar-vault`).
 > **Last commit on branch:** `d30b42a feat(aadhaar-vault): Session 5 Phase 1 — Auth foundation (Bearer JWT plugin)`.
-> **Uncommitted on branch (current Session 5C):** MFA factor model (`vault_mfa_challenges` → `vault_mfa_factors`), `KeyManager.sealSecret/openSecret`, `TotpVerifier` port + `OtpAuthTotpVerifier` (RFC 6238) adapter, `PostgresMfaFactorRepository`, application commands for detokenize/read-audit-history/MFA enroll/MFA verify, and the authenticated `POST /v1/detokenize` route. Test status: **164 tests passing across 14 suites**, `npm run build` clean, `application/` zero `fastify`/`otpauth`/`jose`/`pg` imports.
+> **Uncommitted on branch (current Session 6D):** MFA factor model (`vault_mfa_challenges` → `vault_mfa_factors`), `KeyManager.sealSecret/openSecret`, `TotpVerifier` port + `OtpAuthTotpVerifier` (RFC 6238) adapter, `PostgresMfaFactorRepository`, application commands for detokenize/read-audit-history/MFA enroll/MFA verify, authenticated `POST /v1/detokenize`, `GET /v1/audit`, `POST /v1/mfa/enroll`, and `POST /v1/mfa/verify` routes. Test status: **213 tests passing across 17 suites**, `npm run build` clean, `application/` zero `fastify`/`otpauth`/`jose`/`pg` imports.
 > **Repository:** [`DUKartik/FLN_Open_Source`](https://github.com/DUKartik/FLN_Open_Source) (forked from [`vicharanashala/fln`](https://github.com/vicharanashala/fln)).
 > **Project:** Foundational Literacy & Numeracy (FLN) adaptive assessment platform for early-grade Indian classrooms (Classes 1–5, ages 6–10).
 > **Audience:** contributors, reviewers, and new maintainers. For the operator's guide, see [`RUNNING_THE_PROJECT.md`](./RUNNING_THE_PROJECT.md).
@@ -21,7 +21,7 @@ The platform delivers an adaptive, level-based diagnostic for early-grade math a
 
 The repo also ships an authoritative document set (`docs/`, `Research/`, `FLN Levels Structure/`) that defines the canonical contracts. Inline code lag is expected; **the docs win** when in doubt.
 
-A pre-alpha **Aadhaar Vault microservice** (`microservices/aadhaar-vault/`) was introduced in this fork. Full architecture, decisions, and session history are recorded in §7. As of current HEAD, the vault exposes `POST /v1/tokenize` and `POST /v1/detokenize` behind the Bearer-JWT auth plugin; audit-history and MFA enroll/verify are implemented as application commands but not HTTP routes yet. It has **164 tests passing across 14 suites** and a clean TypeScript build.
+A pre-alpha **Aadhaar Vault microservice** (`microservices/aadhaar-vault/`) was introduced in this fork. Full architecture, decisions, and session history are recorded in §7. As of current HEAD, the vault exposes `POST /v1/tokenize`, `POST /v1/detokenize`, `GET /v1/audit`, `POST /v1/mfa/enroll`, and `POST /v1/mfa/verify` behind the Bearer-JWT auth plugin. MFA enrollment and verification exist as standalone routes, but detokenization is currently gated by JWT scope only; a mandatory detokenization challenge / MFA approval workflow is not wired yet. It has **213 tests passing across 17 suites** and a clean TypeScript build.
 
 ---
 
@@ -73,7 +73,7 @@ FLN_Open_Source/
 │       ├── src/application/ports/   ← clean ports for crypto, auth, TOTP, MFA, persistence
 │       ├── src/infrastructure/      ← adapters for auth, crypto, events, key providers, MFA, DB
 │       ├── src/db/migrations/       ← 001 schema, 002 tokens, 003 MFA factors rename
-│       └── tests/                   ← 164 tests across 14 suites
+│       └── tests/                   ← 213 tests across 17 suites
 │
 ├── docs/                     ← authoritative reference docs (see §6)
 ├── Research/                 ← pedagogy / assessment / case-study corpus
@@ -361,6 +361,10 @@ wrapped_dek = AES-256-GCM(key = subkey, iv = random 12 bytes)
 | `GET /health` | public | Liveness probe — no token required. |
 | `GET /health/ready` | public | Readiness probe — no token required. |
 | `POST /v1/tokenize` | `requireScope('vault:tokenize')` | 401 on missing/invalid; 403 on scope mismatch. |
+| `POST /v1/detokenize` | `requireScope('vault:detokenize')` | Recovers plaintext and appends audit when the caller has scope. It does **not** yet require a fresh MFA challenge/approval. |
+| `GET /v1/audit` | `requireScope('vault:audit')` | Reads audit history for the authenticated principal / requested identity. |
+| `POST /v1/mfa/enroll` | `requireScope('vault:mfa:enroll')` | One-time factor setup: enrolls and seals a TOTP factor, appends audit, publishes event. |
+| `POST /v1/mfa/verify` | `requireScope('vault:mfa:verify')` | Standalone factor proof: verifies an enrolled TOTP factor, marks usage, appends audit, publishes event. |
 
 **Config additions (`.env.example`)**
 
@@ -390,11 +394,14 @@ Missing/short secret or sentinels in `process.env` cause `buildServer` to refuse
 | `tests/read-audit-history.test.ts` | command | 5C | 9 | Audit-history read model: limit defaults/caps, empty history, validation, predictable JSON shape. |
 | `tests/enroll-mfa.test.ts` | command | 5C | 13 | MFA enrollment: factor persistence, per-factor secret sealing, audit/event semantics, plaintext hygiene. |
 | `tests/verify-mfa.test.ts` | command | 5C | 24 | MFA verification: factor state checks, actor matching, code mismatch paths, mark-used, audit/event semantics, plaintext hygiene. |
-| **Total** | | | **164** | |
+| `tests/audit.route.test.ts` | route | 6B | 18 | `GET /v1/audit` query validation, principal-derived actor, auth/scope enforcement, limit bounds, JSON envelope, route registration. |
+| `tests/enroll-mfa.route.test.ts` | route | 6C | 13 | `POST /v1/mfa/enroll` schema validation, dependency guard, principal fallback policy, auth/scope enforcement, route registration. |
+| `tests/verify-mfa.route.test.ts` | route | 6D | 18 | `POST /v1/mfa/verify` schema validation, factor ownership checks, auth/scope enforcement, command error mapping, route registration. |
+| **Total** | | | **213** | |
 
 **Architectural boundary test:** the application layer is verified separately by `grep -r "fastify" application/` — zero matches is the contract.
 
-### 7.13 Current API surface (HEAD — `feature/aadhaar-vault` Session 5C)
+### 7.13 Current API surface (HEAD — `feature/aadhaar-vault` Session 6D)
 
 | Method | Path | Body | Auth | Success | Possible errors |
 |---|---|---|---|---|---|
@@ -402,6 +409,9 @@ Missing/short secret or sentinels in `process.env` cause `buildServer` to refuse
 | GET | `/health/ready` | — | none | 200 `{postgres:"ok",keyProvider:"ok"}` | 503 if either is down |
 | POST | `/v1/tokenize` | `{ raw, type, context }` | `Bearer <jwt>` + `vault:tokenize` scope | 201 `{token,last4,tokenType,auditId,identityId,keyVersion}` | 400, 401, 403, 422, 500, 503 |
 | POST | `/v1/detokenize` | `{ token, context }` | `Bearer <jwt>` + `vault:detokenize` scope | 200 `{token,identityId,aadhaar,last4,auditId}` | 400, 401, 403, 404, 500, 503 |
+| GET | `/v1/audit` | query: `{ identityId?, limit? }` | `Bearer <jwt>` + `vault:audit` scope | 200 `{entries:[...],limit}` | 400, 401, 403, 500, 503 |
+| POST | `/v1/mfa/enroll` | `{ actorId?, factorType, label, context }` | `Bearer <jwt>` + `vault:mfa:enroll` scope | 200 `{factor,auditId}` | 400, 401, 403, 500, 503 |
+| POST | `/v1/mfa/verify` | `{ factorId, code, context }` | `Bearer <jwt>` + `vault:mfa:verify` scope | 200 `{factorId,verified,auditId}` | 400, 401, 403, 404, 422, 500, 503 |
 
 **401 envelope (any `code` from the verifier):**
 
@@ -416,20 +426,19 @@ Missing/short secret or sentinels in `process.env` cause `buildServer` to refuse
 ```
 
 Routes listed in design docs but **not yet implemented** at HEAD:
-- `GET /v1/audit/:identityId` or equivalent audit-history route (application command exists; HTTP route does not)
-- `POST /v1/mfa/enroll` (application command exists; HTTP route does not)
-- `POST /v1/mfa/verify` (application command exists; HTTP route does not)
 - `DELETE /v1/token/:id`
 
 Detokenize caveat: `POST /v1/detokenize` is wired and covered at the route layer, but the current command reconstructs a wrap context that does not match the tokenize command's wrap context. A real tokenize → detokenize round-trip is therefore still a schema/context reconciliation item.
+
+MFA caveat: `POST /v1/mfa/enroll` and `POST /v1/mfa/verify` are implemented as standalone factor-management routes. They are not yet connected to `POST /v1/detokenize` as a required step-up flow. Today, a valid JWT with `vault:detokenize` scope can detokenize directly and receive plaintext; the future workflow should create a detokenization challenge/approval record, verify an enrolled admin factor against that request, and allow detokenization only while that approval is fresh.
 
 ### 7.14 Open work (honest list)
 
 | # | Open item | Why it is incomplete | Severity | Expected session |
 |---|---|---|---|---|
 | 1 | ~~Auth middleware plugin is not implemented. `POST /v1/tokenize` reads `actorId`/`actorRole` from the request body.~~ | **RESOLVED — Session 5.** Auth plugin + HS256 verifier + scope enforcement + integration tests are landed. The route still accepts `actorId`/`actorRole` in the body for backward compatibility and as a server-side identity override; the principal is now derived from the verified JWT. | high | — |
-| 2 | Audit-history HTTP route is not exposed. | `ReadAuditHistory` application command is implemented and tested; route schema, auth scope, and handler remain. | medium | Session 6 |
-| 3 | MFA HTTP routes are not exposed. | `EnrollMfa` and `VerifyMfa` commands are implemented and tested; `POST /v1/mfa/enroll` and `POST /v1/mfa/verify` still need route schemas, scope checks, and handlers. | medium | Session 6 |
+| 2 | ~~Audit-history HTTP route is not exposed.~~ | **RESOLVED — Session 6B.** `GET /v1/audit` is wired behind `vault:audit`, derives principal context from the JWT, validates query params, and is route-tested. | medium | — |
+| 3 | ~~MFA HTTP routes are not exposed.~~ | **RESOLVED — Sessions 6C/6D.** `POST /v1/mfa/enroll` and `POST /v1/mfa/verify` are wired behind dedicated scopes, use the existing commands, and are route-tested. | medium | — |
 | 4 | Production-grade `EventPublisher` (Redis Streams / Kafka / SQS). | The in-process adapter is sufficient for tests and the single-process deployment; any fan-out deployment needs a real transport. | low | Session 6+ |
 | 5 | Audit-chain HMAC and key-rotation orchestration are intentionally out of the `KeyManager` port. | Those responsibilities belong to a future service that picks its own key material; bolting them onto `KeyManager` would couple concerns. | medium | Session 6+ |
 | 6 | Real KMS adapter (AWS / GCP / HashiCorp Vault) replacing `LocalDevKeyManager`. | Design is intentional; the production-safety guard exists. The adapter code path is not yet codified. | medium | Session 6+ |
@@ -438,6 +447,7 @@ Detokenize caveat: `POST /v1/detokenize` is wired and covered at the route layer
 | 9 | `MemoryPool` SQL dialect is narrow by design; it throws on divergent queries. New query shapes in adapters must be added to the dialect to keep their tests green. | This is by design (failing fast), but it is ongoing work as the adapter surface grows. | low | ongoing |
 | 10 | JWKS / RS256 verifier for production-grade issuer validation. | HS256 is fine for internal/trusted-issuer deployments; public-token-issuer deployments would need asymmetric verification. | medium | Session 7+ |
 | 11 | Refresh / revocation list for tokens. | Out of scope for the current hour-bound token window; will become relevant when the lookup route lands. | low | Session 7+ |
+| 12 | Mandatory MFA step-up for detokenization. | MFA enroll/verify routes exist, but detokenize does not yet create or require an MFA-backed approval/challenge. Current authorization is JWT scope-only, so `vault:detokenize` can return plaintext directly. | high | Session 7+ |
 
 ---
 
@@ -482,17 +492,18 @@ Issues are recorded with their originating context and marked RESOLVED when fixe
 | 2 | Only one `KeyManager` adapter (`local-dev`) is implemented. Production needs a real KMS adapter (AWS / GCP / HashiCorp) before the prod-guard override should ever be toggled. | aadhaar-vault | medium | open — deferred to Session 6+ |
 | 3 | Audit-chain HMAC and key-rotation orchestration are intentionally out of the `KeyManager` port and not yet implemented. | aadhaar-vault | medium | open — deferred to Session 6+ |
 | 4 | `POST /v1/tokenize` had no auth middleware; read `actorId`/`actorRole` from the request body. | aadhaar-vault | high | **RESOLVED** — Session 5 lands HS256 JWT auth + scope enforcement. |
-| 5 | Audit-history flow has an application command but no HTTP route. | aadhaar-vault | medium | open — deferred to Session 6 |
-| 6 | MFA enroll / verify flows have application commands but no HTTP routes. | aadhaar-vault | medium | open — deferred to Session 6 |
+| 5 | Audit-history flow has an application command but no HTTP route. | aadhaar-vault | medium | **RESOLVED** — Session 6B wires `GET /v1/audit`. |
+| 6 | MFA enroll / verify flows have application commands but no HTTP routes. | aadhaar-vault | medium | **RESOLVED** — Sessions 6C/6D wire `POST /v1/mfa/enroll` and `POST /v1/mfa/verify`. |
 | 7 | In-process `EventPublisher` only; production wiring (Redis Streams / Kafka / SQS) is not done. | aadhaar-vault | low | open — deferred to Session 6+ |
-| 8 | The two backend trees (`backend/src/` and `backend/fln-backend/`) both exist and are not interchangeable. `MIGRATION_PLAN.md` describes the merge. | backend | medium | open |
-| 9 | `backend/data/db.json` is runtime-mutated and not in `.gitignore`. | backend hygiene | low | open |
-| 10 | `frontend/server.err` is committed (a Vite log). | frontend hygiene | low | open |
-| 11 | Frontend auth is plaintext-Bearer-email; `JWT_SECRET` is configured but not actually used by login. | security | medium | open |
-| 12 | Two pre-existing `tsc --noEmit` errors in the main backend: `backend/src/index.ts:665`, `backend/src/paperGenerator.ts:233`. Tests do not exist; type-check is the only static guard. | DX | medium | open |
-| 13 | `frontend/src/VITE_API_URL` mismatch (`:5000` vs `:3000` proxy target) — currently moot because the mock wins. | frontend | low | open |
-| 14 | No committed GitHub Actions workflow (`~/.github/workflows`). | CI | medium | open |
-| 15 | `.gitignore` re-saved as UTF-16 on Windows silently disables ignore patterns — historic incident. | DX | low | open |
+| 8 | Detokenize is not yet bound to a mandatory MFA approval/challenge. | aadhaar-vault | high | open — MFA routes exist, but `vault:detokenize` scope currently permits direct plaintext recovery. |
+| 9 | The two backend trees (`backend/src/` and `backend/fln-backend/`) both exist and are not interchangeable. `MIGRATION_PLAN.md` describes the merge. | backend | medium | open |
+| 10 | `backend/data/db.json` is runtime-mutated and not in `.gitignore`. | backend hygiene | low | open |
+| 11 | `frontend/server.err` is committed (a Vite log). | frontend hygiene | low | open |
+| 12 | Frontend auth is plaintext-Bearer-email; `JWT_SECRET` is configured but not actually used by login. | security | medium | open |
+| 13 | Two pre-existing `tsc --noEmit` errors in the main backend: `backend/src/index.ts:665`, `backend/src/paperGenerator.ts:233`. Tests do not exist; type-check is the only static guard. | DX | medium | open |
+| 14 | `frontend/src/VITE_API_URL` mismatch (`:5000` vs `:3000` proxy target) — currently moot because the mock wins. | frontend | low | open |
+| 15 | No committed GitHub Actions workflow (`~/.github/workflows`). | CI | medium | open |
+| 16 | `.gitignore` re-saved as UTF-16 on Windows silently disables ignore patterns — historic incident. | DX | low | open |
 
 ---
 
@@ -500,6 +511,39 @@ Issues are recorded with their originating context and marked RESOLVED when fixe
 
 - Default branch tracks the canonical `docs/` reference set and the historic backend tree.
 - `microservices/aadhaar-vault/` was introduced in this fork. Chronological session log:
+
+> **Session 8 — Console Refactoring & UX Improvements (in progress)**
+>
+> **Status:** Phase 1 of 4 complete (modularization). Phases 2-4 queued.
+>
+> **Scope:** Developer console only — architecture, routes, payloads, and
+> backend API contract remain frozen.
+>
+> **Changes:**
+>
+> - New shared modules under `console/`:
+>   `config.js`, `storage.js`, `logger.js`, `ui.js`, `api.js`.
+> - `app.js` (was 917 lines) and `stepup.js` (was 412 lines) refactored
+>   onto the shared modules; no behaviour changes, no UI changes.
+> - New test suite `tests/console.test.ts` (7/7 passing) validates
+>   `Api.baseUrl`, `Api.parseJwt`, `storage.get/set/remove`,
+>   `logger.logRequest`, `ui.formToObject`, `ui.toast`, `ui.pre`.
+> - `styles.css` deliberately unchanged (Phase 3 will introduce tokens,
+>   consolidated buttons, dark-mode audit).
+> - `SESSION_8_DELIVERABLES.md` captures the full review, refactor plan,
+>   and Phase 2-4 backlog.
+>
+> **Out of scope (preserved):** routes, payloads, response shapes,
+> auth/MFA/step-up flow, storage keys, default actor / JWT / API URL.
+>
+> **Known unrelated:** pre-existing backend test failures in
+> `mfa.routes.test.ts`, `detokenize.route.test.ts`, `verify-mfa.route.test.ts`
+> reproduce on `origin/feature/aadhaar-vault` HEAD before any console
+> change (verified via `git stash -u && vitest run`).
+>
+> **Next:** Phase 2 — UX improvements (collapsible panels, copy buttons,
+> status pills, auto-derive fields).
+
 
 | Session | Commit | High-level summary | Tests added | Build |
 |---|---|---|---|---|
@@ -511,6 +555,9 @@ Issues are recorded with their originating context and marked RESOLVED when fixe
 | 5 | `d30b42a` | **Auth foundation (Phase 1):** `JwtVerifier` port, `Hs256JwtVerifier` adapter, Fastify auth plugin (`principal` + `requireScope`), `createJwtVerifier` factory, `.env.example` updates, `health` routes made public, `POST /v1/tokenize` gated by `vault:tokenize` scope. Dependency-free `mintTestToken` helper. 8th test suite. Central error handler now maps `JwtVerificationError` → 401 with `{error, message, code}` and `ScopeRequiredError` → 403. | hs256-jwt-verifier (13) + auth.plugin (9) = 22 new cases | green — 66/66 across 8 suites; `tsc --noEmit` clean |
 | **5 Phase 2** | **HEAD (uncommitted)** | **MFA factor model + TOTP verifier:** rename `vault_mfa_challenges` → `vault_mfa_factors` (migration 003), `MfaFactorRepository` port, `PostgresMfaFactorRepository` adapter, `TotpVerifier` port, `OtpAuthTotpVerifier` (RFC 6238 — 31 tests including all three SHA vectors), `KeyManager.sealSecret/openSecret` extension, `app.totpVerifier` decorator, `db/index.ts` schema mirror updated. 9th test suite. Architectural invariant: `application/` zero `fastify`/`otpauth`/`jose`/`pg` imports — verified. | totp-verifier (31) + db (+5 = 11 total) | green — 98/98 across 9 suites; `tsc --noEmit` clean |
 | **5C** | **HEAD (uncommitted)** | **Command surface expansion + detokenize route:** `DetokenizeAadhaar`, `ReadAuditHistory`, `EnrollMfa`, and `VerifyMfa` application commands landed with in-memory port fakes and plaintext-hygiene checks. `POST /v1/detokenize` is registered behind `vault:detokenize`, validates `{ token, context }`, maps auth/scope/schema/not-found errors, and returns JSON envelopes. Detokenize still has a tokenize → detokenize wrap-context reconciliation caveat. Audit-history and MFA routes are still open. | detokenize command (9) + detokenize route (11) + read-audit-history (9) + enroll-mfa (13) + verify-mfa (24) = 66 new cases | **green — 164/164 across 14 suites; `npm run build` clean** |
+| **6B** | **HEAD (uncommitted)** | **Audit HTTP route:** `GET /v1/audit` registered behind `vault:audit`, query validation added, route derives actor context from JWT principal, missing-dependency path returns 503, route tests cover auth/scope/schema/limit/error envelopes. | audit.route (18) | green |
+| **6C** | **HEAD (uncommitted)** | **MFA enroll HTTP route:** `POST /v1/mfa/enroll` registered behind `vault:mfa:enroll`, validates strict body/context shape, seals factor secrets through `KeyManager`, appends audit, publishes event, and returns a JSON-safe factor envelope. | enroll-mfa.route (13) | green |
+| **6D** | **HEAD (uncommitted)** | **MFA verify HTTP route:** `POST /v1/mfa/verify` registered behind `vault:mfa:verify`, validates code/factor context, opens sealed factor secrets, maps command errors, marks successful use, appends audit, and publishes event. | verify-mfa.route (18) | **green — 213/213 across 17 suites; `npm run build` clean** |
 
 - `CHANGELOG.md` is the chronological source of truth for past releases.
 - `AUDIT.md` carries the most recent audit summary.
