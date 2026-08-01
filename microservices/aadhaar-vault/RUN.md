@@ -37,10 +37,10 @@ node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"   # 
 npm install
 docker compose up -d postgres                     # or use a host Postgres
 npm run migrate                                    # runs migrations 001–003 in order
-npm run dev                                        # boots the service on :3000
+npm run dev                                        # boots the service on :4101
 
 # in another terminal:
-curl http://localhost:3000/health
+curl http://localhost:4101/health
 # {"status":"ok"}
 ```
 
@@ -132,7 +132,7 @@ npm run dev
 You should see something like:
 
 ```
-{"level":"info","host":"0.0.0.0","port":3000,"msg":"aadhaar-vault listening"}
+{"level":"info","host":"0.0.0.0","port":4101,"msg":"aadhaar-vault listening"}
 {"level":"info","postgres":"ok","keyProvider":"ok","msg":"ready"}
 ```
 
@@ -185,7 +185,7 @@ npm run dev
 docker compose up --build
 ```
 
-`Dockerfile` is multi-stage: `npm ci` → `npm run build` (esbuild) → distroless runtime. The compose file maps `127.0.0.1:3000:3000` and reads `.env` from the host.
+`Dockerfile` is multi-stage: `npm ci` → `npm run build` (esbuild) → distroless runtime. The compose file maps `127.0.0.1:4101:4101` and reads `.env` from the host.
 
 ---
 
@@ -298,14 +298,14 @@ After saving Settings, the Tokenize, Detokenize, MFA, and Audit screens will sen
 ### 7.3 Hit `/health` (public)
 
 ```bash
-curl http://localhost:3000/health
+curl http://localhost:4101/health
 # {"status":"ok"}
 ```
 
 ### 7.4 Hit `/v1/tokenize` (auth + scope required)
 
 ```bash
-curl -X POST http://localhost:3000/v1/tokenize \
+curl -X POST http://localhost:4101/v1/tokenize \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -346,7 +346,7 @@ All env vars go in `microservices/aadhaar-vault/.env` (copy from `.env.example`)
 |---|---|---|---|
 | `NODE_ENV` | recommended | `development` | `production` enforces the `LocalDevKeyManager` guard |
 | `HOST` | no | `0.0.0.0` | bind interface |
-| `PORT` | no | `3000` | listen port (note: collides with the main backend on `:3000` if both run locally) |
+| `PORT` | no | `4101` | listen port |
 | `LOCAL_DEV_MASTER_KEY` | **yes** | — | base64-encoded master key; refuses to boot below 32 bytes |
 | `SERVICE_JWT_HMAC_SECRET` | **yes** | — | shared HS256 secret; refuses to boot below 32 bytes |
 | `SERVICE_JWT_ISSUER` | no | unset | expected `iss` claim; rejects on mismatch when set |
@@ -367,14 +367,14 @@ After the service is up:
 ### 9.1 Liveness
 
 ```bash
-curl -i http://localhost:3000/health
+curl -i http://localhost:4101/health
 # expect: HTTP/1.1 200 OK ; body {"status":"ok"}
 ```
 
 ### 9.2 Readiness
 
 ```bash
-curl -i http://localhost:3000/health/ready
+curl -i http://localhost:4101/health/ready
 # expect: HTTP/1.1 200 OK ; body {"postgres":"ok","keyProvider":"ok"}
 ```
 
@@ -383,7 +383,7 @@ If you see 503, see §11.
 ### 9.3 401 without a token
 
 ```bash
-curl -i -X POST http://localhost:3000/v1/tokenize \
+curl -i -X POST http://localhost:4101/v1/tokenize \
   -H "Content-Type: application/json" \
   -d '{"context":"x/y/z","identity_type":"aadhaar","plaintext":"123412341234"}'
 # expect: HTTP/1.1 401 Unauthorized ; body {"error":"unauthorized","message":"Missing or malformed Authorization header"}
@@ -420,7 +420,7 @@ node dist/server.cjs
 
 ```bash
 docker build -t aadhaar-vault:dev .
-docker run --rm -p 3000:3000 --env-file .env aadhaar-vault:dev
+docker run --rm -p 4101:4101 --env-file .env aadhaar-vault:dev
 ```
 
 ### 10.2 Bring up Postgres + the app via compose
@@ -451,7 +451,7 @@ docker compose logs -f aadhaar-vault
 | Boot fails with `SERVICE_JWT_HMAC_SECRET shorter than 32 bytes` | secret too short | regenerate with the same command above |
 | `/health/ready` returns 503 with `postgres: "down"` | DB unreachable or migrations not applied | `docker compose ps postgres`; `npm run migrate`; verify `DATABASE_URL` |
 | `/health/ready` returns 503 with `keyProvider: "down"` | `LocalDevKeyManager` refused to construct | in production: unset `VAULT_ALLOW_UNSAFE_KEY_PROVIDER` and provide a real KMS adapter; in dev: ensure `LOCAL_DEV_MASTER_KEY` is set |
-| `EADDRINUSE :3000` | Another process (often the main FLN backend) holds the port | `netstat -ano \| grep :3000` + `taskkill //PID <pid> //F` (Windows), or `lsof -ti:3000 \| xargs kill` (Unix). Or change `PORT` in `.env`. |
+| `EADDRINUSE :4101` | Another process (often the main FLN backend) holds the port | `netstat -ano \| grep :4101` + `taskkill //PID <pid> //F` (Windows), or `lsof -ti:4101 \| xargs kill` (Unix). Or change `PORT` in `.env`. |
 | `npm run migrate` hangs forever | Wrong `DATABASE_URL` or Postgres not reachable | `psql "$DATABASE_URL" -c 'select 1'` first |
 | `401 unauthorized` with `code: "signature_invalid"` | Token was minted with a different secret than the server is reading | Re-export `SERVICE_JWT_HMAC_SECRET` from `.env` (not from your shell) and re-mint |
 | `403 forbidden` on a route that should accept your token | Token's `scope` (or `scp`) does not contain the required scope | Re-mint with `scope: "vault:tokenize"` (space-delimited string) or `scp: ["vault:tokenize"]` (array) |
@@ -469,14 +469,14 @@ If a fix isn't here — open an issue or ask the team before guessing on anythin
 
 | Endpoint | URL | Auth | Purpose |
 |---|---|---|---|
-| Liveness | `GET http://localhost:3000/health` | none | k8s liveness probe |
-| Readiness | `GET http://localhost:3000/health/ready` | none | k8s readiness probe; reports `postgres` + `keyProvider` |
-| Tokenise | `POST http://localhost:3000/v1/tokenize` | `Bearer <jwt>` + `vault:tokenize` | mint a token for an identity |
-| MFA enroll | `POST http://localhost:3000/v1/mfa/enroll` | `Bearer <jwt>` + `vault:mfa:enroll` | register a TOTP factor for an actor |
-| Request detokenization | `POST http://localhost:3000/v1/detokenize/request` | `Bearer <jwt>` + `vault:detokenize` | mint a step-up challenge |
-| Verify MFA | `POST http://localhost:3000/v1/mfa/verify` | `Bearer <jwt>` + `vault:mfa:verify` | approve a step-up challenge |
-| Detokenize (Step-Up) | `POST http://localhost:3000/v1/detokenize` | `Bearer <jwt>` + `vault:detokenize` | consume a challenge, return plaintext |
-| Audit | `GET http://localhost:3000/v1/audit` | `Bearer <jwt>` + `vault:audit:read` | read recent audit events |
+| Liveness | `GET http://localhost:4101/health` | none | k8s liveness probe |
+| Readiness | `GET http://localhost:4101/health/ready` | none | k8s readiness probe; reports `postgres` + `keyProvider` |
+| Tokenise | `POST http://localhost:4101/v1/tokenize` | `Bearer <jwt>` + `vault:tokenize` | mint a token for an identity |
+| MFA enroll | `POST http://localhost:4101/v1/mfa/enroll` | `Bearer <jwt>` + `vault:mfa:enroll` | register a TOTP factor for an actor |
+| Request detokenization | `POST http://localhost:4101/v1/detokenize/request` | `Bearer <jwt>` + `vault:detokenize` | mint a step-up challenge |
+| Verify MFA | `POST http://localhost:4101/v1/mfa/verify` | `Bearer <jwt>` + `vault:mfa:verify` | approve a step-up challenge |
+| Detokenize (Step-Up) | `POST http://localhost:4101/v1/detokenize` | `Bearer <jwt>` + `vault:detokenize` | consume a challenge, return plaintext |
+| Audit | `GET http://localhost:4101/v1/audit` | `Bearer <jwt>` + `vault:audit:read` | read recent audit events |
 
 See [§9a](#9a-step-up-detokenization-walkthrough) for the full Step-Up walkthrough and [STEP_UP_AUTH.md](./STEP_UP_AUTH.md) for the threat model.
 
@@ -513,7 +513,7 @@ TOKEN=$(node -e "
 ### 9a.2 Tokenise an Aadhaar number
 
 ```bash
-TOKENISE=$(curl -s -X POST http://localhost:3000/v1/tokenize \
+TOKENISE=$(curl -s -X POST http://localhost:4101/v1/tokenize \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -532,7 +532,7 @@ VID=$(echo "$TOKENISE" | jq -r .token)
 ### 9a.3 Enrol an MFA factor (TOTP)
 
 ```bash
-ENROL=$(curl -s -X POST http://localhost:3000/v1/mfa/enroll \
+ENROL=$(curl -s -X POST http://localhost:4101/v1/mfa/enroll \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -549,7 +549,7 @@ echo "factor=$FACTOR_ID secret=$SECRET"
 ### 9a.4 Request a detokenization challenge
 
 ```bash
-REQ=$(curl -s -X POST http://localhost:3000/v1/detokenize/request \
+REQ=$(curl -s -X POST http://localhost:4101/v1/detokenize/request \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d "{
@@ -586,7 +586,7 @@ CODE=$(node -e "
   console.log(String(code % 1_000_000).padStart(6,'0'));
 ")
 
-curl -s -X POST http://localhost:3000/v1/mfa/verify \
+curl -s -X POST http://localhost:4101/v1/mfa/verify \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d "{
@@ -601,7 +601,7 @@ curl -s -X POST http://localhost:3000/v1/mfa/verify \
 ### 9a.6 Detokenize (consume the challenge)
 
 ```bash
-curl -s -X POST http://localhost:3000/v1/detokenize \
+curl -s -X POST http://localhost:4101/v1/detokenize \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d "{
@@ -618,7 +618,7 @@ curl -s -X POST http://localhost:3000/v1/detokenize \
 ### 9a.7 Replay (must be rejected)
 
 ```bash
-curl -i -X POST http://localhost:3000/v1/detokenize \
+curl -i -X POST http://localhost:4101/v1/detokenize \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d "{ \"challengeId\": \"$CHALLENGE_ID\", \"context\": { ... } }"
@@ -666,12 +666,12 @@ docker compose up -d postgres
 npm run migrate
 
 # every day
-npm run dev                                            # http://localhost:3000
+npm run dev                                            # http://localhost:4101
 
 # tests + type-check
 npm test                                               # 98/98 expected
 npx tsc --noEmit                                       # clean expected
 
 # smoke test
-curl http://localhost:3000/health
+curl http://localhost:4101/health
 # then mint a JWT (see §7) and POST /v1/tokenize

@@ -23,7 +23,6 @@ Deferred or limited:
 
 - `KEY_PROVIDER=local-dev` is development-only and is blocked in production unless explicitly overridden.
 - Only `SERVICE_JWT_ALGORITHM=HS256` is currently wired. RS256/JWKS support is not implemented yet.
-- The current detokenize command contains a documented wrap-context reconciliation caveat; see `src/routes/detokenize.routes.ts`.
 - No OpenAPI document is generated yet.
 
 ## Stack
