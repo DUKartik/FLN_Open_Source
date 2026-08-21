@@ -1,4 +1,4 @@
-import { apiFetch } from '../services/apiClient';
+import { apiFetch, withBase } from '../services/apiClient';
 import React, { useState, useEffect } from 'react';
 import { UserRole } from '../types';
 import { FileText, Download, Clock, AlertCircle, CheckCircle2, XCircle } from 'lucide-react';
@@ -7,7 +7,10 @@ interface BulkDiagnosticWorkflowProps {
   user: any;
   token: string;
   userRole: UserRole;
-  onBack: () => void;
+  // Optional so this can be embedded inline (e.g. issue #175's Diagnostic
+  // Test panel) without the standalone "Back to Dashboard" header — pass it
+  // only when this is used as its own full-screen step.
+  onBack?: () => void;
 }
 
 interface JobStatus {
@@ -150,12 +153,14 @@ export const BulkDiagnosticWorkflow: React.FC<BulkDiagnosticWorkflowProps> = ({ 
             Specify the class level and the number of students to generate and print baseline diagnostic papers
           </p>
         </div>
-        <button
-          onClick={onBack}
-          className="text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:hover:text-zinc-300 font-medium text-sm border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
-        >
-          Back to Dashboard
-        </button>
+        {onBack && (
+          <button
+            onClick={onBack}
+            className="text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:hover:text-zinc-300 font-medium text-sm border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+          >
+            Back to Dashboard
+          </button>
+        )}
       </div>
 
       {error && (
@@ -278,7 +283,7 @@ export const BulkDiagnosticWorkflow: React.FC<BulkDiagnosticWorkflowProps> = ({ 
           {job.status === 'completed' && (
             <div className="flex flex-wrap items-center gap-3">
               <a
-                href={job.pdfUrl || job.downloadUrl || '#'}
+                href={job.pdfUrl ? withBase(job.pdfUrl) : job.downloadUrl ? withBase(job.downloadUrl) : '#'}
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex items-center gap-2 bg-green-600 hover:bg-green-700 text-white font-semibold text-sm py-3 px-6 rounded-xl transition-all shadow-sm cursor-pointer"
