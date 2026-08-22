@@ -516,6 +516,27 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   testHistory: 'testHistory',
 };
 
+/**
+ * Aadhaar-sensitive fields that may ONLY be written by the tokenized creation
+ * path (routes/students.ts → createStudentFromData via addStudent). Every key
+ * that could carry a raw number, a vault reference, or the mask is listed so
+ * updateStudent()'s generic $set can never reintroduce plaintext or clobber
+ * vault references through a future, less careful caller.
+ *
+ * Deliberately broader than the Student interface: includes legacy/spelling
+ * variants (`aadhar`, `aadhaarNumber`) that a well-meaning future contributor
+ * might reach for.
+ */
+const AADHAAR_PROTECTED_UPDATE_FIELDS: readonly string[] = [
+  'aadhaar',
+  'aadhar',
+  'aadharNumber',
+  'aadhaarNumber',
+  'aadhaarTokenId',
+  'aadhaarIdentityId',
+  'aadharMasked',
+];
+
 export class DBStore {
   private data: DatabaseSchema | null = null;
   public useMongo: boolean = false;
@@ -579,6 +600,14 @@ export class DBStore {
           await studentsColl.createIndex({ schoolId: 1 });
           await studentsColl.createIndex({ teacherId: 1 });
           await studentsColl.createIndex({ aadharMasked: 1 });
+          // Phase 2 hardening: layer-2 duplicate detection queries this field
+          // on every registration (routes/students.ts → getExistingAadhaar-
+          // IdentityIds). Deliberately NON-unique for now: legacy records may
+          // predate aadhaarIdentityId or contain duplicate values, and a
+          // unique constraint introduced blind would turn reads/writes of
+          // those rows into errors. Revisit uniqueness only after
+          // scripts/audit-aadhaar-at-rest.ts reports the data is clean.
+          await studentsColl.createIndex({ aadhaarIdentityId: 1 });
           console.log('Successfully ensured indexes on "students" collection');
         } catch (e: any) {
           console.warn('Failed to ensure indexes on "students" collection:', e.message);
@@ -1300,8 +1329,33 @@ export class DBStore {
   }
 
   async updateStudent(studentId: string, updates: Partial<Student>) {
-    await this.mongoDb!.collection('students').updateOne({ id: studentId }, { $set: updates });
-    const s = await this.mongoDb!.collection<Student>('students').findOne({ id: studentId });
+    // Defense-in-depth (Phase 2 hardening): routes whitelist their fields
+    // today, but this mutator accepts any Partial<Student>. Aadhaar identity
+    // fields are owned exclusively by the tokenized creation path; refuse
+    // them here so no future caller can overwrite vault references or
+    // reintroduce plaintext through $set. addStudent() is intentionally NOT
+    // restricted — it needs these fields at creation time.
+    const blocked = Object.keys(updates).filter(k => AADHAAR_PROTECTED_UPDATE_FIELDS.includes(k));
+    if (blocked.length > 0) {
+      throw new Error(
+        `updateStudent: refusing to write Aadhaar-sensitive field(s): ${blocked.join(', ')}. `
+        + 'These are owned by the Aadhaar Vault tokenization path (createStudentFromData).',
+      );
+    }
+    // Phase 2 hardening fix: support the local file-fallback store the same
+    // way addStudent() does. The previous unconditional `this.mongoDb!`
+    // crashed every level/profile PATCH when MongoDB was absent.
+    if (!this.mongoDb) {
+      const list = this.data?.students;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === studentId);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
+    await this.mongoDb.collection('students').updateOne({ id: studentId }, { $set: updates });
+    const s = await this.mongoDb.collection<Student>('students').findOne({ id: studentId });
     if (s && this.data) {
       const idx = this.data.students.findIndex(x => x.id === studentId);
       if (idx !== -1) this.data.students[idx] = s;
@@ -1414,8 +1468,19 @@ export class DBStore {
   }
 
   async addLog(log: LogEntry) {
-    await this.mongoDb!.collection('logbook').insertOne(log);
-    if (this.data) this.data.logbook.unshift(log);
+    // Phase 2 hardening fix: guard the Mongo write like addStudent() does.
+    // Previously `this.mongoDb!` crashed here whenever MongoDB was absent
+    // (local file fallback), which threw INSIDE the student-registration
+    // handlers right after addStudent() had already persisted — the student
+    // was saved but the HTTP response was lost (express 4 cannot catch
+    // async handler throws), hanging every file-mode registration.
+    if (this.mongoDb) {
+      await this.mongoDb.collection('logbook').insertOne(log);
+    }
+    if (this.data) {
+      this.data.logbook.unshift(log);
+      if (!this.mongoDb) await this.save();
+    }
     return log;
   }
 

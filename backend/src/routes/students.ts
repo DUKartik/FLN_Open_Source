@@ -12,6 +12,18 @@ import { CURRICULUM_MAPPING } from '../config/curriculumMap';
 import { computeStudentDisplayId } from '../displayId';
 import { tokenizeAadhaar, formatAadhaarMask, AadhaarVaultTokenizeResult } from '../aadhaarVault';
 
+// ─── Response hygiene (Phase 2 hardening) ───────────────────────────────────
+// Vault references are internal-only: MongoDB and the internal Student model
+// keep aadhaarTokenId / aadhaarIdentityId (duplicate detection, future
+// detokenize-by-token flows), but API clients never need them. Every student
+// serialization below goes through this helper so the wire contract carries
+// only what the existing frontend actually consumes.
+export type PublicStudent = Omit<Student, 'aadhaarTokenId' | 'aadhaarIdentityId'>;
+function toPublicStudent(s: Student): PublicStudent {
+  const { aadhaarTokenId: _tokenId, aadhaarIdentityId: _identityId, ...pub } = s;
+  return pub;
+}
+
 export function registerStudentRoutes(app: express.Express) {
   // Students
   app.get('/api/students', async (req, res) => {
@@ -46,12 +58,14 @@ export function registerStudentRoutes(app: express.Express) {
       ? students.filter(s => user.assignedSchools?.includes(s.schoolId))
       : students;
 
-    // Mask Aadhar for non-Superadmins (§13.2 R-6)
+    // Mask Aadhar for non-Superadmins (§13.2 R-6); strip vault references
+    // for everyone (Phase 2 hardening).
     const masked = filtered.map(s => {
+      const pub = toPublicStudent(s);
       if (user.role !== UserRole.SUPERADMIN) {
-        return { ...s, aadharMasked: 'XXXX-XXXX-' + String(s.aadharMasked || '').slice(-4) };
+        pub.aadharMasked = 'XXXX-XXXX-' + String(pub.aadharMasked || '').slice(-4);
       }
-      return s;
+      return pub;
     });
 
     // total count (for client-side pagination headers)
@@ -74,10 +88,12 @@ export function registerStudentRoutes(app: express.Express) {
       role === UserRole.SUPERADMIN || role === UserRole.SCHOOL || role === UserRole.TEACHER;
 
     // Mask Aadhar for non-Superadmins (§13.2 R-6); redact guardian contact/address similarly.
+    // Vault references are stripped for every role (Phase 2 hardening).
     const maskedStudents = students.map(s => {
-      const masked = user.role !== UserRole.SUPERADMIN
-        ? { ...s, aadharMasked: 'XXXX-XXXX-' + s.aadharMasked.slice(-4) }
-        : { ...s };
+      const masked = toPublicStudent(s);
+      if (user.role !== UserRole.SUPERADMIN) {
+        masked.aadharMasked = 'XXXX-XXXX-' + String(masked.aadharMasked || '').slice(-4);
+      }
       if (!canSeeGuardianPII(user.role)) {
         delete masked.guardianContact;
         delete masked.address;
@@ -87,7 +103,8 @@ export function registerStudentRoutes(app: express.Express) {
 
     let scoped: typeof maskedStudents;
     if (user.role === UserRole.SUPERADMIN) {
-      scoped = students;
+      // Superadmins keep full mask + guardian PII, but never vault references.
+      scoped = students.map(s => toPublicStudent(s));
     } else if (user.role === UserRole.SCHOOL || user.role === UserRole.TEACHER) {
       scoped = maskedStudents.filter(s => s.schoolId === user.schoolId);
     } else if (user.role === UserRole.VOLUNTEER) {
@@ -203,7 +220,14 @@ export function registerStudentRoutes(app: express.Express) {
         requestId: `fln-student-create-${Date.now()}`,
       });
     } catch (err: any) {
-      console.error('Aadhaar vault tokenization error:', err?.message || err);
+      // Phase 2 hardening: VaultError carries a stable code + HTTP-ish status
+      // for precise diagnosis. Messages never contain raw Aadhaar or tokens.
+      console.error(
+        'Aadhaar vault tokenization error:',
+        `code=${err?.code ?? 'UNKNOWN'}`,
+        `status=${err?.status ?? 'n/a'}`,
+        err?.message || err,
+      );
       return { error: 'Aadhaar tokenization failed. Please try again later.' };
     }
     // Deterministic duplicate check against the vault identity id. This is
@@ -307,7 +331,9 @@ export function registerStudentRoutes(app: express.Express) {
       details: `Onboarded and verified student: ${result.student.name}`,
     });
 
-    res.json(result.student);
+    // Response hygiene: the creation response carries the same public shape
+    // as GET /api/students — no vault references on the wire.
+    res.json(toPublicStudent(result.student));
   });
 
   // ─── POST /api/students/bulk-import ─────────────────────────────────────────
