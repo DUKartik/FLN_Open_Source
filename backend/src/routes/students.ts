@@ -10,6 +10,7 @@ import { AI_SERVICES_DIR, PYTHON_BIN } from '../config';
 import { resolvePrerequisites, describeConcept } from '../competencyPrerequisites';
 import { CURRICULUM_MAPPING } from '../config/curriculumMap';
 import { computeStudentDisplayId } from '../displayId';
+import { tokenizeAadhaar, formatAadhaarMask, AadhaarVaultTokenizeResult } from '../aadhaarVault';
 
 export function registerStudentRoutes(app: express.Express) {
   // Students
@@ -180,13 +181,37 @@ export function registerStudentRoutes(app: express.Express) {
       }
     }
 
-    // Aadhar uniqueness — SRS §13.2 R-6 (issue.txt: "ID card is unique")
+    // Aadhaar uniqueness + tokenization — the raw 12-digit Aadhaar is never
+    // stored in MongoDB. We send it to the Aadhaar Vault (microservices/
+    // aadhaar-vault/) and persist only a mask, an opaque token, and the vault's
+    // deterministic identity id (see ../aadhaarVault.ts).
     const rawAadhar = String(aadharNumber).replace(/[^0-9]/g, '');
-    if (rawAadhar.length < 4) {
-      return { error: 'Invalid identity document — must contain at least 4 digits.' };
+    if (!/^[0-9]{12}$/.test(rawAadhar)) {
+      return { error: 'Invalid Aadhaar number. Expected 12 digits.' };
     }
-    if (existingAadhars.has(rawAadhar)) {
-      return { error: 'A student with this Aadhar / ID number is already registered.' };
+    const aadhaarMask = formatAadhaarMask(rawAadhar);
+    if (existingAadhars.has(rawAadhar) || existingAadhars.has(aadhaarMask)) {
+      return { error: 'A student with this Aadhaar / ID number is already registered.' };
+    }
+
+    // Tokenize through the Aadhaar Vault. If the vault is unavailable the
+    // registration fails cleanly rather than persisting a plaintext Aadhaar.
+    let tokenized: AadhaarVaultTokenizeResult;
+    try {
+      tokenized = await tokenizeAadhaar(rawAadhar, {
+        email: actingUser.email,
+        requestId: `fln-student-create-${Date.now()}`,
+      });
+    } catch (err: any) {
+      console.error('Aadhaar vault tokenization error:', err?.message || err);
+      return { error: 'Aadhaar tokenization failed. Please try again later.' };
+    }
+    // Deterministic duplicate check against the vault identity id. This is
+    // what catches a re-registration of the same Aadhaar even after the raw
+    // number has been removed from the collection.
+    const dupByIdentity = ((await dbStore.getExistingAadhaarIdentityIds([tokenized.identityId])).size ?? 0) > 0;
+    if (dupByIdentity) {
+      return { error: 'A student with this Aadhaar / ID number is already registered.' };
     }
 
     // Derive the clean numeric display ID (#184) from the school's geo hierarchy
@@ -223,7 +248,9 @@ export function registerStudentRoutes(app: express.Express) {
       currentLevel: null,
       currentSubLevel: null,
       targetLevel: null,
-      aadharMasked: rawAadhar,
+      aadharMasked: aadhaarMask,
+      aadhaarTokenId: tokenized.token,
+      aadhaarIdentityId: tokenized.identityId,
       levelHistory: [],
       streak: 0,
     };
@@ -238,6 +265,7 @@ export function registerStudentRoutes(app: express.Express) {
     await dbStore.addStudent(newStudent);
     // Track in-memory so bulk operations detect intra-batch duplicates too
     existingAadhars.add(rawAadhar);
+    existingAadhars.add(aadhaarMask);
     return { student: newStudent };
   }
 
@@ -253,9 +281,10 @@ export function registerStudentRoutes(app: express.Express) {
       return res.status(403).json({ error: 'Forbidden.' });
     }
 
-    // Build aadhars set for uniqueness check
+    // Build aadhars set for uniqueness check (raw + mask, so both legacy
+    // raw records and tokenized/masked records are caught).
     const rawAadhar = String(req.body.aadharNumber).replace(/[^0-9]/g, '');
-    const existingAadhars = await dbStore.getExistingAadhars([rawAadhar]);
+    const existingAadhars = await dbStore.getExistingAadhars([rawAadhar, formatAadhaarMask(rawAadhar)]);
 
     const result = await createStudentFromData(
       { ...req.body, schoolId: req.body.schoolId || user.schoolId },
@@ -304,8 +333,12 @@ export function registerStudentRoutes(app: express.Express) {
     }
 
     // Pre-load all existing aadhar numbers once; the helper adds new ones as
-    // it inserts, so intra-batch duplicates are caught too.
-    const aadharsInBatch = rows.map(r => String(r.aadharNumber).replace(/[^0-9]/g, '')).filter(Boolean);
+    // it inserts, so intra-batch duplicates are caught too. Includes both raw
+    // and masked forms so legacy raw records and tokenized records both match.
+    const aadharsInBatch = rows.flatMap(r => {
+      const raw = String(r.aadharNumber).replace(/[^0-9]/g, '');
+      return raw ? [raw, formatAadhaarMask(raw)] : [];
+    });
     const existingAadhars = await dbStore.getExistingAadhars(aadharsInBatch);
 
     const results: {

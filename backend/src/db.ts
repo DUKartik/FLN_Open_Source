@@ -108,7 +108,9 @@ export interface Student {
   currentLevel: number | null;
   currentSubLevel?: number | null;
   targetLevel: number | null;
-  aadharMasked: string; // Mandatory, unique identifier masked (§13.2 R-6)
+  aadharMasked: string; // Masked identifier only; the plaintext Aadhaar is never stored in MongoDB.
+  aadhaarTokenId?: string; // Opaque token returned by Aadhaar Vault.
+  aadhaarIdentityId?: string; // Deterministic identity id used for duplicate detection.
   // Clean numeric ID for teacher-facing display (roster, profile, printed
   // worksheets) — see backend/src/displayId.ts. Derived from the same
   // non-sensitive state/district/block/school/class/sequence hierarchy
@@ -1266,6 +1268,22 @@ export class DBStore {
     const set = new Set<string>();
     (this.data?.students || []).forEach(s => {
       if (aadhars.includes(s.aadharMasked)) set.add(s.aadharMasked);
+    });
+    return set;
+  }
+
+  async getExistingAadhaarIdentityIds(identityIds: string[]): Promise<Set<string>> {
+    const cleanIds = identityIds.filter(Boolean);
+    if (cleanIds.length === 0) return new Set<string>();
+    if (this.mongoDb) {
+      const docs = await this.mongoDb.collection('students')
+        .find({ aadhaarIdentityId: { $in: cleanIds } }, { projection: { aadhaarIdentityId: 1 } })
+        .toArray();
+      return new Set(docs.map(d => d.aadhaarIdentityId).filter(Boolean));
+    }
+    const set = new Set<string>();
+    (this.data?.students || []).forEach(s => {
+      if (s.aadhaarIdentityId && cleanIds.includes(s.aadhaarIdentityId)) set.add(s.aadhaarIdentityId);
     });
     return set;
   }
