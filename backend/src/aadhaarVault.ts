@@ -17,9 +17,22 @@
 //   - Clear fail-closed configuration error when the service JWT secret is
 //     missing. Registration still fails; nothing is ever written.
 //
+// Step-up workflow (Session 7E — full end-to-end admin detokenization):
+//   The vault's step-up flow has four additional endpoints the backend
+//   needs to drive from an admin request:
+//     - POST /v1/mfa/enroll                               — `enrollMfa`
+//     - POST /v1/detokenize/request                       — `requestDetokenization`
+//     - POST /v1/detokenize/step-up/:challengeId/approve  — `approveStepUpChallenge`
+//     - POST /v1/detokenize                               — `detokenizeAadhaar`
+//   These reuse the same service-JWT / timeout / error mapping infra as
+//   `tokenizeAadhaar`. They MUST NOT be invoked from the browser — the
+//   Vault never issues user-scoped JWTs, only service-scoped HS256 tokens
+//   minted here.
+//
 // Logging hygiene: no message produced here ever contains the raw Aadhaar,
-// the minted service JWT, or any secret — only stable error codes, HTTP
-// statuses and transport-level descriptions.
+// the minted service JWT, the TOTP code, the otpauth URI (which encodes the
+// shared secret), or any secret — only stable error codes, HTTP statuses
+// and transport-level descriptions.
 import jwt from 'jsonwebtoken';
 import { randomUUID } from 'crypto';
 
@@ -62,25 +75,41 @@ export type VaultErrorCode =
   | 'TIMEOUT'
   // Vault answered successfully but the body was unusable / contract-breaking.
   | 'MALFORMED_RESPONSE'
-  // The vault's own stable error codes (tokenize.routes.ts ERROR_STATUS).
+  // The vault's own stable error codes (tokenize / detokenize / mfa / step-up).
   | 'INVALID_INPUT'
   | 'UNAUTHORIZED'
   | 'FORBIDDEN'
   | 'PEPPER_MISMATCH'
   | 'RATE_LIMIT'
   | 'INTERNAL'
+  // Step-up lifecycle codes (mirrored 1:1 from the vault routes).
+  | 'TOKEN_NOT_FOUND'
+  | 'IDENTITY_NOT_FOUND'
+  | 'FACTOR_NOT_FOUND'
+  | 'FACTOR_NOT_ACTIVE'
+  | 'FACTOR_EXPIRED'
+  | 'CHALLENGE_NOT_FOUND'
+  | 'CHALLENGE_NOT_PENDING'
+  | 'CHALLENGE_NOT_APPROVED'
+  | 'CHALLENGE_EXPIRED'
+  | 'CHALLENGE_CONSUMED'
+  | 'CHALLENGE_OPERATION_MISMATCH'
+  | 'ACTOR_MISMATCH'
+  | 'CODE_MISMATCH'
+  | 'CODE_REPLAYED'
+  | 'UNWRAP_FAILED'
+  | 'DECRYPTION_FAILED'
+  | 'INVALID_PAYLOAD'
   // Any other non-OK status whose body does not carry a known code.
   | 'UNKNOWN_VAULT_ERROR';
 
 /**
- * Typed failure thrown by {@link tokenizeAadhaar}.
+ * Typed failure thrown by every method on this module.
  *
  * `status` mirrors the closest HTTP status so internal handlers can reason
  * about retryability (4xx vs 5xx vs transport) WITHOUT parsing messages.
  * Messages are safe to log: they never contain raw Aadhaar, bearer tokens,
- * or vault secrets — only stable codes and transport descriptions. The
- * public API keeps returning its generic application-level error; this
- * type exists for backend logs and internal handling only.
+ * TOTP secrets, or vault secrets — only stable codes and transport descriptions.
  */
 export class VaultError extends Error {
   readonly code: VaultErrorCode;
@@ -94,7 +123,19 @@ export class VaultError extends Error {
   }
 }
 
-function buildVaultServiceJwt(): string {
+// ---------------------------------------------------------------------------
+// Service JWT — used by every method below. The vault routes partition
+// authorization by the `scope` claim (see each route file in the vault repo):
+//   - vault:tokenize        — POST /v1/tokenize
+//   - vault:mfa:enroll      — POST /v1/mfa/enroll
+//   - vault:detokenize      — POST /v1/detokenize/request
+//                             POST /v1/detokenize/step-up/:challengeId/approve
+//                             POST /v1/detokenize
+// We mint a fresh token per request to keep the token's lifetime narrow and
+// prevent replay across method boundaries.
+// ---------------------------------------------------------------------------
+
+function buildVaultServiceJwt(scope: 'vault:tokenize' | 'vault:mfa:enroll' | 'vault:detokenize'): string {
   if (!AADHAAR_VAULT_SERVICE_JWT_SECRET) {
     // Fail closed BEFORE any network call, with an actionable message that
     // names the exact variables an operator must set (values never logged).
@@ -103,7 +144,7 @@ function buildVaultServiceJwt(): string {
       500,
       'AADHAAR_VAULT_SERVICE_JWT_SECRET is not configured. Set AADHAAR_VAULT_URL and '
         + 'AADHAAR_VAULT_SERVICE_JWT_SECRET (plus optionally AADHAAR_VAULT_SERVICE_JWT_ISSUER / '
-        + '_AUDIENCE / _SUBJECT) to match the vault deployment. Registration cannot proceed '
+        + '_AUDIENCE / _SUBJECT) to match the vault deployment. The requested Vault operation cannot proceed '
         + 'safely until this is fixed.',
     );
   }
@@ -118,7 +159,7 @@ function buildVaultServiceJwt(): string {
   return jwt.sign(
     {
       sub: AADHAAR_VAULT_SERVICE_JWT_SUBJECT,
-      scope: 'vault:tokenize',
+      scope,
     },
     AADHAAR_VAULT_SERVICE_JWT_SECRET,
     signingOptions,
@@ -132,6 +173,15 @@ export type AadhaarTokenizeContext = {
   requestId?: string;
 };
 
+/** Caller context for the step-up + MFA endpoints. Distinct from
+ *  `AadhaarTokenizeContext` because the vault requires an `actorRole`
+ *  drawn from a fixed enum (see vault route schemas).
+ */
+export type AadhaarActorContext = AadhaarTokenizeContext & {
+  /** Vault-side role. Maps FLN role → Vault role. Required. */
+  actorRole: 'TEACHER' | 'SCHOOL_ADMIN' | 'STATE_ADMIN' | 'SUPER_ADMIN' | 'SERVICE';
+};
+
 /** Resolved per call so ops can tune it via env without touching code. */
 function resolveTimeoutMs(): number {
   const parsed = Number(process.env.AADHAAR_VAULT_TIMEOUT_MS);
@@ -139,42 +189,27 @@ function resolveTimeoutMs(): number {
 }
 
 /**
- * Tokenize a raw 12-digit Aadhaar with the Aadhaar Vault microservice.
- * The raw value is sent to the vault over HTTPS and is never stored in the
- * FLN backend's own database.
- *
- * Throws {@link VaultError} on ANY failure — callers must fail the
- * registration; there is no plaintext fallback path by design.
+ * Internal: a single fetch wrapper that all methods share. Maps transport
+ * errors to VaultError with stable codes, parses JSON bodies (best-effort),
+ * and lets the caller decide success criteria.
  */
-export async function tokenizeAadhaar(
-  rawAadhar: string,
-  context: AadhaarTokenizeContext = {},
-): Promise<AadhaarVaultTokenizeResult> {
-  const serviceJwt = buildVaultServiceJwt();
-  const timeoutMs = resolveTimeoutMs();
+async function callVault(
+  path: string,
+  scope: 'vault:tokenize' | 'vault:mfa:enroll' | 'vault:detokenize',
+  body: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<{ status: number; data: any }> {
+  const serviceJwt = buildVaultServiceJwt(scope);
 
   let response: Response;
   try {
-    response = await fetch(`${AADHAAR_VAULT_URL}/v1/tokenize`, {
+    response = await fetch(`${AADHAAR_VAULT_URL}${path}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${serviceJwt}`,
       },
-      body: JSON.stringify({
-        raw: rawAadhar,
-        type: 'AADHAAR',
-        context: {
-          actorId: AADHAAR_VAULT_SERVICE_JWT_SUBJECT,
-          actorRole: 'SERVICE',
-          reason: `Aadhaar tokenization for student registration by ${context.email || 'unknown user'}`,
-          requestId: context.requestId || `fln-${randomUUID()}`,
-          sourceIp: context.sourceIp,
-          userAgent: context.userAgent,
-        },
-      }),
-      // Phase 2 hardening: bound the request so a hung vault fails the
-      // registration quickly instead of hanging the HTTP request.
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err: any) {
@@ -191,20 +226,66 @@ export async function tokenizeAadhaar(
   // Body parse is best-effort: error responses are JSON today, but a proxy
   // or 5xx page may not be. Body contents are never echoed on parse failure.
   const data: any = await response.json().catch(() => null);
+  return { status: response.status, data };
+}
 
-  if (!response.ok) {
-    const vaultCode: string = typeof data?.error === 'string' ? data.error : '';
-    const knownCodes: readonly VaultErrorCode[] = [
-      'INVALID_INPUT', 'UNAUTHORIZED', 'FORBIDDEN', 'PEPPER_MISMATCH', 'RATE_LIMIT', 'INTERNAL',
-    ];
-    const code: VaultErrorCode = knownCodes.find(c => c === vaultCode) ?? 'UNKNOWN_VAULT_ERROR';
-    // The vault returns stable, generic messages (it never echoes input),
-    // so surfacing data.message internally is safe; fall back to status alone.
-    const message: string =
-      typeof data?.message === 'string' && data.message.length > 0
-        ? data.message
-        : `Aadhaar Vault returned HTTP ${response.status}.`;
-    throw new VaultError(code, response.status, message);
+/** Maps a vault `error` field (string) to a known VaultErrorCode. The set
+ *  below covers every code listed in the vault route ERROR_STATUS tables.
+ */
+const KNOWN_VAULT_CODES: readonly VaultErrorCode[] = [
+  'INVALID_INPUT', 'UNAUTHORIZED', 'FORBIDDEN', 'PEPPER_MISMATCH', 'RATE_LIMIT', 'INTERNAL',
+  'TOKEN_NOT_FOUND', 'IDENTITY_NOT_FOUND',
+  'FACTOR_NOT_FOUND', 'FACTOR_NOT_ACTIVE', 'FACTOR_EXPIRED',
+  'CHALLENGE_NOT_FOUND', 'CHALLENGE_NOT_PENDING', 'CHALLENGE_NOT_APPROVED',
+  'CHALLENGE_EXPIRED', 'CHALLENGE_CONSUMED', 'CHALLENGE_OPERATION_MISMATCH',
+  'ACTOR_MISMATCH', 'CODE_MISMATCH', 'CODE_REPLAYED',
+  'UNWRAP_FAILED', 'DECRYPTION_FAILED', 'INVALID_PAYLOAD',
+];
+
+function mapVaultErrorResponse(status: number, data: any): VaultError {
+  const vaultCode: string = typeof data?.error === 'string' ? data.error : '';
+  const code: VaultErrorCode = KNOWN_VAULT_CODES.find(c => c === vaultCode) ?? 'UNKNOWN_VAULT_ERROR';
+  // The vault returns stable, generic messages (it never echoes input),
+  // so surfacing data.message internally is safe; fall back to status alone.
+  const message: string =
+    typeof data?.message === 'string' && data.message.length > 0
+      ? data.message
+      : `Aadhaar Vault returned HTTP ${status}.`;
+  return new VaultError(code, status, message);
+}
+
+// ===========================================================================
+// POST /v1/tokenize
+// ===========================================================================
+
+/**
+ * Tokenize a raw 12-digit Aadhaar with the Aadhaar Vault microservice.
+ * The raw value is sent to the vault over HTTPS and is never stored in the
+ * FLN backend's own database.
+ *
+ * Throws {@link VaultError} on ANY failure — callers must fail the
+ * registration; there is no plaintext fallback path by design.
+ */
+export async function tokenizeAadhaar(
+  rawAadhar: string,
+  context: AadhaarTokenizeContext = {},
+): Promise<AadhaarVaultTokenizeResult> {
+  const timeoutMs = resolveTimeoutMs();
+  const { status, data } = await callVault('/v1/tokenize', 'vault:tokenize', {
+    raw: rawAadhar,
+    type: 'AADHAAR',
+    context: {
+      actorId: AADHAAR_VAULT_SERVICE_JWT_SUBJECT,
+      actorRole: 'SERVICE',
+      reason: `Aadhaar tokenization for student registration by ${context.email || 'unknown user'}`,
+      requestId: context.requestId || `fln-${randomUUID()}`,
+      sourceIp: context.sourceIp,
+      userAgent: context.userAgent,
+    },
+  }, timeoutMs);
+
+  if (!status.toString().startsWith('2')) {
+    throw mapVaultErrorResponse(status, data);
   }
 
   // Success-contract check (POST /v1/tokenize → 201 with these fields).
@@ -221,4 +302,286 @@ export async function tokenizeAadhaar(
   }
 
   return data as AadhaarVaultTokenizeResult;
+}
+
+// ===========================================================================
+// POST /v1/mfa/enroll
+// ===========================================================================
+
+export type EnrollMfaParams = {
+  /** The principal whose TOTP factor is being enrolled. FLN maps the
+   *  admin's email here so a single SUPERADMIN/ADMIN has their own factor. */
+  actor: string;
+  label?: string;
+  algorithm?: 'SHA1' | 'SHA256' | 'SHA512';
+  digits?: number;
+  period?: number;
+  context: AadhaarActorContext;
+};
+
+export type EnrollMfaResult = {
+  factorId: string;
+  otpauthUri: string;
+  factor: Record<string, unknown>;
+};
+
+/**
+ * Enroll a TOTP MFA factor for a given actor (admin). Returns the
+ * `otpauth://` URI for the QR code and the factor envelope.
+ *
+ * The returned `otpauthUri` embeds the TOTP secret — the frontend MUST
+ * treat it as a secret (only render the QR / copy-to-clipboard inside the
+ * admin's session, never persist it on the FLN side, never log it).
+ *
+ * Throws {@link VaultError} on any failure.
+ */
+export async function enrollMfa(params: EnrollMfaParams): Promise<EnrollMfaResult> {
+  const timeoutMs = resolveTimeoutMs();
+  const body: Record<string, unknown> = {
+    actor: params.actor,
+    context: {
+      actorId: params.actor,
+      actorRole: params.context.actorRole,
+      reason: `MFA enrollment for ${params.actor} — ${params.context.email || 'fln admin'}`,
+      requestId: params.context.requestId || `fln-${randomUUID()}`,
+      sourceIp: params.context.sourceIp,
+      userAgent: params.context.userAgent,
+    },
+  };
+  if (params.label !== undefined) body.label = params.label;
+  if (params.algorithm !== undefined) body.algorithm = params.algorithm;
+  if (params.digits !== undefined) body.digits = params.digits;
+  if (params.period !== undefined) body.period = params.period;
+
+  const { status, data } = await callVault('/v1/mfa/enroll', 'vault:mfa:enroll', body, timeoutMs);
+
+  if (!status.toString().startsWith('2')) {
+    throw mapVaultErrorResponse(status, data);
+  }
+
+  if (
+    !data ||
+    typeof data.factorId !== 'string' || data.factorId.length === 0 ||
+    typeof data.otpauthUri !== 'string' || data.otpauthUri.length === 0
+  ) {
+    throw new VaultError(
+      'MALFORMED_RESPONSE',
+      502,
+      'Aadhaar Vault returned a success status without the required MFA factorId/otpauthUri fields.',
+    );
+  }
+
+  return {
+    factorId: data.factorId,
+    otpauthUri: data.otpauthUri,
+    factor: data.factor ?? {},
+  };
+}
+
+// ===========================================================================
+// POST /v1/detokenize/request
+// ===========================================================================
+
+export type RequestDetokenizationParams = {
+  /** Resolved by the FLN backend from the authorized student record. */
+  tokenId: string;
+  /** The admin's factor id (returned by `enrollMfa`). */
+  factorId: string;
+  context: AadhaarActorContext;
+};
+
+export type RequestDetokenizationResult = {
+  challengeId: string;
+  expiresAt: string;
+  requiredFactor: Record<string, unknown>;
+};
+
+/**
+ * Mint a step-up challenge bound to a specific token and admin MFA factor.
+ * Returns the challenge id the admin must approve with a TOTP code.
+ *
+ * Throws {@link VaultError} on any failure.
+ */
+export async function requestDetokenization(
+  params: RequestDetokenizationParams,
+): Promise<RequestDetokenizationResult> {
+  const timeoutMs = resolveTimeoutMs();
+  const { status, data } = await callVault('/v1/detokenize/request', 'vault:detokenize', {
+    tokenId: params.tokenId,
+    factorId: params.factorId,
+    context: {
+      actorId: params.context.email || AADHAAR_VAULT_SERVICE_JWT_SUBJECT,
+      actorRole: params.context.actorRole,
+      reason: `Step-up challenge for admin detokenization — ${params.context.email || 'fln admin'}`,
+      requestId: params.context.requestId || `fln-${randomUUID()}`,
+      sourceIp: params.context.sourceIp,
+      userAgent: params.context.userAgent,
+    },
+  }, timeoutMs);
+
+  if (!status.toString().startsWith('2')) {
+    throw mapVaultErrorResponse(status, data);
+  }
+
+  if (
+    !data ||
+    typeof data.challengeId !== 'string' || data.challengeId.length === 0 ||
+    typeof data.expiresAt !== 'string' && !(data.expiresAt instanceof Date)
+  ) {
+    throw new VaultError(
+      'MALFORMED_RESPONSE',
+      502,
+      'Aadhaar Vault returned a success status without the required challengeId/expiresAt fields.',
+    );
+  }
+
+  return {
+    challengeId: data.challengeId,
+    expiresAt: data.expiresAt instanceof Date ? data.expiresAt.toISOString() : data.expiresAt,
+    requiredFactor: data.requiredFactor ?? {},
+  };
+}
+
+// ===========================================================================
+// POST /v1/detokenize/step-up/:challengeId/approve
+// ===========================================================================
+
+export type ApproveStepUpParams = {
+  challengeId: string;
+  /** 6-digit TOTP code from the admin's authenticator app. NEVER logged. */
+  code: string;
+  context: AadhaarActorContext;
+};
+
+export type ApproveStepUpResult = {
+  challengeId: string;
+  status: 'approved';
+  approvedAt: string;
+  verifiedFactorId: string;
+};
+
+/**
+ * Approve a step-up challenge by submitting the admin's TOTP code.
+ *
+ * Throws {@link VaultError} on any failure — including CODE_MISMATCH
+ * (mapped to 403) and CHALLENGE_EXPIRED (mapped to 410).
+ */
+export async function approveStepUpChallenge(
+  params: ApproveStepUpParams,
+): Promise<ApproveStepUpResult> {
+  const timeoutMs = resolveTimeoutMs();
+  const { status, data } = await callVault(
+    `/v1/detokenize/step-up/${encodeURIComponent(params.challengeId)}/approve`,
+    'vault:detokenize',
+    {
+      code: params.code,
+      context: {
+        actorId: params.context.email || AADHAAR_VAULT_SERVICE_JWT_SUBJECT,
+        actorRole: params.context.actorRole,
+        reason: `Step-up approval for admin detokenization — ${params.context.email || 'fln admin'}`,
+        requestId: params.context.requestId || `fln-${randomUUID()}`,
+        sourceIp: params.context.sourceIp,
+        userAgent: params.context.userAgent,
+      },
+    },
+    timeoutMs,
+  );
+
+  if (!status.toString().startsWith('2')) {
+    throw mapVaultErrorResponse(status, data);
+  }
+
+  if (
+    !data ||
+    typeof data.challengeId !== 'string' || data.challengeId.length === 0 ||
+    data.status !== 'approved'
+  ) {
+    throw new VaultError(
+      'MALFORMED_RESPONSE',
+      502,
+      'Aadhaar Vault returned a success status without a confirmed approved challenge.',
+    );
+  }
+
+  return {
+    challengeId: data.challengeId,
+    status: 'approved',
+    approvedAt: data.approvedAt,
+    verifiedFactorId: data.verifiedFactorId,
+  };
+}
+
+// ===========================================================================
+// POST /v1/detokenize
+// ===========================================================================
+
+export type DetokenizeParams = {
+  challengeId: string;
+  context: AadhaarActorContext;
+};
+
+export type DetokenizeResult = {
+  token: string;
+  identityId: string;
+  /** Plaintext 12-digit Aadhaar — TEMPORARY. Must not be persisted / cached
+   *  beyond the lifetime of the admin's reveal step. The frontend clears it
+   *  on dialog close and after a short auto-clear timer. */
+  aadhaar: string;
+  last4: string;
+  auditId: string;
+};
+
+/**
+ * Consume an approved step-up challenge and recover the plaintext Aadhaar.
+ *
+ * Throws {@link VaultError} on any failure. The most important domain
+ * failures are:
+ *   - CHALLENGE_CONSUMED  (409) — replay attempt
+ *   - CHALLENGE_EXPIRED   (410) — stale challenge
+ *   - CHALLENGE_NOT_APPROVED (403) — caller skipped the approve step
+ *   - ACTOR_MISMATCH      (403) — caller did not mint this challenge
+ *
+ * Callers MUST handle the plaintext according to the system-wide "never
+ * persist / never cache" rule (clear it after the admin is done viewing).
+ */
+export async function detokenizeAadhaar(
+  params: DetokenizeParams,
+): Promise<DetokenizeResult> {
+  const timeoutMs = resolveTimeoutMs();
+  const { status, data } = await callVault('/v1/detokenize', 'vault:detokenize', {
+    challengeId: params.challengeId,
+    context: {
+      actorId: params.context.email || AADHAAR_VAULT_SERVICE_JWT_SUBJECT,
+      actorRole: params.context.actorRole,
+      reason: `Detokenization for admin reveal — ${params.context.email || 'fln admin'}`,
+      requestId: params.context.requestId || `fln-${randomUUID()}`,
+      sourceIp: params.context.sourceIp,
+      userAgent: params.context.userAgent,
+    },
+  }, timeoutMs);
+
+  if (!status.toString().startsWith('2')) {
+    throw mapVaultErrorResponse(status, data);
+  }
+
+  if (
+    !data ||
+    typeof data.token !== 'string' || data.token.length === 0 ||
+    typeof data.aadhaar !== 'string' || data.aadhaar.length === 0 ||
+    typeof data.identityId !== 'string' || data.identityId.length === 0
+  ) {
+    throw new VaultError(
+      'MALFORMED_RESPONSE',
+      502,
+      'Aadhaar Vault returned a success status without the required detokenize fields.',
+    );
+  }
+
+  return {
+    token: data.token,
+    identityId: data.identityId,
+    aadhaar: data.aadhaar,
+    last4: data.last4,
+    auditId: data.auditId,
+  };
 }

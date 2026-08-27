@@ -33,6 +33,7 @@ import { registerSchoolRoutes } from './routes/schools';
 import { registerInterventionRoutes } from './routes/interventions';
 import { registerBestPracticeRoutes } from './routes/bestPractices';
 import { registerStudentRoutes } from './routes/students';
+import { registerAadhaarDetokenizeRoutes } from './routes/aadhaarDetokenize';
 import { registerWorksheetRoutes } from './routes/worksheets';
 import { registerEvaluationRoutes } from './routes/evaluation';
 import { registerAnalyticsRoutes } from './routes/analytics';
@@ -122,6 +123,8 @@ registerStatsRoutes(app);
   registerClassRoutes(app);
 
   registerStudentRoutes(app);
+  // Admin Step-Up detokenization (Aadhaar Vault — see aadhaarDetokenize.ts).
+  registerAadhaarDetokenizeRoutes(app);
 
   registerEvaluationRoutes(app);
   registerWorksheetRoutes(app);

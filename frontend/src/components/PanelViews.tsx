@@ -12,6 +12,7 @@ import { TestHistoryPanel } from './panels/TestHistoryPanel';
 import { WorksheetTemplatesPanel } from './panels/WorksheetTemplatesPanel';
 import { SystemSettingsPanel } from './panels/SystemSettingsPanel';
 import { StudentListPanel } from './panels/StudentListPanel';
+import { AadhaarRevealPanel } from './panels/AadhaarRevealPanel';
 import { DiagnosticTestPanel } from './panels/DiagnosticTestPanel';
 import { PerformancePanel } from './panels/PerformancePanel';
 import { WorksheetsPanel } from './panels/WorksheetsPanel';
@@ -105,6 +106,19 @@ export const PanelViews: React.FC<PanelViewsProps> = ({ activePanel, currentUser
   if (panel === 'analytics') return <AnalyticsPanel currentUser={currentUser} schools={schools} students={students} getDistrictStats={getDistrictStats} getBlockStats={getBlockStats} />;
 
   if (panel === 'system_settings') return <SystemSettingsPanel />;
+
+  // Admin-only Step-Up Aadhaar Reveal (see backend/src/routes/aadhaarDetokenize.ts).
+  // The panel itself enforces role gating as a defence-in-depth; the menu
+  // also gates visibility to admin roles in Layout.tsx.
+  if (panel === 'aadhaar_reveal') {
+    return (
+      <AadhaarRevealPanel
+        students={students}
+        currentUser={currentUser}
+        token={token}
+      />
+    );
+  }
 
   // Fallback for any unmatched panel — renders the roles workspace (dashboard) as the content
   return null;

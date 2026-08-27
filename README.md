@@ -121,6 +121,45 @@ Demo login after seeding: `superadmin@fln.org`, password `Fln@2026` (see
 emails, which follow a predictable `role.<state>_<district>_<block>_<school>@fln.org`
 pattern).
 
+### Aadhaar Vault (student tokenization)
+
+Student registration tokenizes the 12-digit Aadhaar through a separate
+microservice at [`microservices/aadhaar-vault/`](microservices/aadhaar-vault/) —
+the FLN backend never stores plaintext Aadhaar and never exposes Vault
+service JWTs to the browser (see
+[`backend/src/aadhaarVault.ts`](backend/src/aadhaarVault.ts) and
+[`backend/src/routes/students.ts`](backend/src/routes/students.ts)).
+
+Before `POST /api/students` and `POST /api/students/bulk-import` will
+succeed on a fresh clone, bring the Vault up:
+
+```bash
+cd microservices/aadhaar-vault
+cp .env.example .env
+# Generate and paste two secrets (instructions in microservices/aadhaar-vault/RUN.md §3.2):
+#   - LOCAL_DEV_MASTER_KEY         (base64; ≥ 32 decoded bytes)
+#   - SERVICE_JWT_HMAC_SECRET      (raw; ≥ 32 chars)
+npm install
+docker compose up -d postgres
+npm run migrate
+npm run dev          # boots the Vault API on :4101
+```
+
+Then populate `backend/.env` (copy of `backend/.env.example`) with the
+matching service-JWT trio — `AADHAAR_VAULT_URL`, `AADHAAR_VAULT_SERVICE_JWT_SECRET`,
+`AADHAAR_VAULT_SERVICE_JWT_ISSUER`, `AADHAAR_VAULT_SERVICE_JWT_AUDIENCE` — so the
+two processes trust each other. Until these are set, registration fails
+fast with `VaultError NOT_CONFIGURED` (by design — no plaintext fallback).
+
+Full operator guide, env-var reference, and Step-Up detokenization walkthrough:
+[`microservices/aadhaar-vault/RUN.md`](microservices/aadhaar-vault/RUN.md).
+
+End-to-end contract is enforced by the integration test suite at
+[`backend/tests/aadhaar-hardening.test.ts`](backend/tests/aadhaar-hardening.test.ts)
+(run with `npm test` from `backend/`) and by the read-only at-rest audit
+at [`backend/scripts/audit-aadhaar-at-rest.ts`](backend/scripts/audit-aadhaar-at-rest.ts)
+(`npm run audit:aadhaar`).
+
 ## Rules
  Contributor Onboarding — Onboarding Document (Mandatory)
 
