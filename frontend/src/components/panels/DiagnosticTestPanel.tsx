@@ -1,14 +1,15 @@
 // Issue #175: rebuild — CSV upload (feeds #178's real bulk-import endpoint),
 // then the existing BulkDiagnosticWorkflow (reused as-is, not rewritten —
-// it already calls the real POST /api/diagnostic/bulk route), plus a simple
-// on-screen exam timer. Pending/Completed lists kept below as supplementary
-// context, same data as before.
-import React, { useState, useEffect, useRef } from 'react';
+// it already calls the real POST /api/diagnostic/bulk route). Pending/
+// Completed lists kept below as supplementary context, same data as before.
+// The exam timer that used to live here was removed for the pilot phase —
+// it wasn't wired to anything and pilot testing isn't timing exams.
+import React, { useState } from 'react';
 import { Student, User } from '../../types';
 import { PageHeader } from './PanelShared';
-import { ShieldAlert, CheckCircle2, Upload, Timer as TimerIcon } from 'lucide-react';
+import { ShieldAlert, CheckCircle2, Upload } from 'lucide-react';
 import { apiFetch } from '../../services/apiClient';
-import { parseCSVText } from '../RoleDashboards';
+import { parseCSVText, FLNLevelReferenceModal } from '../RoleDashboards';
 import { BulkDiagnosticWorkflow } from '../BulkDiagnosticWorkflow';
 
 interface DiagnosticTestPanelProps {
@@ -17,8 +18,6 @@ interface DiagnosticTestPanelProps {
   token: string;
   refreshStudents: () => void;
 }
-
-const TIMER_PRESETS_MIN = [15, 30, 45, 60];
 
 export const DiagnosticTestPanel: React.FC<DiagnosticTestPanelProps> = ({ students, currentUser, token, refreshStudents }) => {
   const pending = students.filter(s => s.levelHistory.length === 0);
@@ -29,6 +28,11 @@ export const DiagnosticTestPanel: React.FC<DiagnosticTestPanelProps> = ({ studen
   const [csvImporting, setCsvImporting] = useState(false);
   const [csvResults, setCsvResults] = useState<any>(null);
   const [csvError, setCsvError] = useState('');
+
+  // Issue #166: 93 FLN Framework reference modal — moved here from the
+  // Teacher/Volunteer dashboards so the framework reference lives next to
+  // the diagnostic test where it's actually used for placement decisions.
+  const [showLevelRef, setShowLevelRef] = useState(false);
 
   const handleCsvUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -59,44 +63,26 @@ export const DiagnosticTestPanel: React.FC<DiagnosticTestPanelProps> = ({ studen
     }
   };
 
-  // Simple exam timer — purely client-side, no backend dependency. Counts
-  // down from a chosen duration for the in-class exam window.
-  const [timerMinutes, setTimerMinutes] = useState(30);
-  const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
-  const [timerRunning, setTimerRunning] = useState(false);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  useEffect(() => {
-    if (timerRunning && secondsLeft !== null && secondsLeft > 0) {
-      intervalRef.current = setInterval(() => {
-        setSecondsLeft(s => (s !== null && s > 0 ? s - 1 : 0));
-      }, 1000);
-    }
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [timerRunning, secondsLeft === null]);
-
-  useEffect(() => {
-    if (secondsLeft === 0) setTimerRunning(false);
-  }, [secondsLeft]);
-
-  const startTimer = () => { setSecondsLeft(timerMinutes * 60); setTimerRunning(true); };
-  const pauseTimer = () => setTimerRunning(false);
-  const resumeTimer = () => { if (secondsLeft && secondsLeft > 0) setTimerRunning(true); };
-  const resetTimer = () => { setTimerRunning(false); setSecondsLeft(null); };
-  const formatTime = (s: number) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
-
   return (
     <div className="space-y-6">
       {/* CSV upload */}
       <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl p-6 shadow-sm space-y-4">
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
           <PageHeader title="Upload Class Roster" desc="Bring in a whole class via CSV before generating diagnostic papers" icon={<Upload className="h-5 w-5" />} />
-          <button
-            onClick={() => { setShowCsvImport(!showCsvImport); setCsvResults(null); setCsvError(''); }}
-            className="bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-xs font-mono px-4 py-2.5 rounded-lg transition-colors cursor-pointer shrink-0"
-          >
-            {showCsvImport ? 'Close CSV Import' : '⬆ Bulk Import CSV'}
-          </button>
+          <div className="flex gap-2 shrink-0">
+            <button
+              onClick={() => setShowLevelRef(true)}
+              className="bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-mono text-xs font-semibold px-4 py-2.5 rounded-lg transition-colors cursor-pointer"
+            >
+              📖 93 FLN Framework
+            </button>
+            <button
+              onClick={() => { setShowCsvImport(!showCsvImport); setCsvResults(null); setCsvError(''); }}
+              className="bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-xs font-mono px-4 py-2.5 rounded-lg transition-colors cursor-pointer"
+            >
+              {showCsvImport ? 'Close CSV Import' : '⬆ Bulk Import CSV'}
+            </button>
+          </div>
         </div>
         {showCsvImport && (
           <div className="border-t border-slate-100 dark:border-slate-800 pt-4 space-y-3">
@@ -126,45 +112,6 @@ export const DiagnosticTestPanel: React.FC<DiagnosticTestPanelProps> = ({ studen
             )}
           </div>
         )}
-      </div>
-
-      {/* Exam timer */}
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl p-6 shadow-sm space-y-4">
-        <PageHeader title="Exam Timer" desc="A simple on-screen timer for the in-class exam window" icon={<TimerIcon className="h-5 w-5" />} />
-        <div className="flex flex-wrap items-center gap-4">
-          <div className="flex gap-2">
-            {TIMER_PRESETS_MIN.map(m => (
-              <button
-                key={m}
-                onClick={() => setTimerMinutes(m)}
-                disabled={secondsLeft !== null}
-                className={`px-3 py-1.5 text-xs font-mono font-bold rounded border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
-                  timerMinutes === m ? 'bg-slate-900 dark:bg-white text-white dark:text-slate-900 border-transparent' : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
-                }`}
-              >
-                {m}m
-              </button>
-            ))}
-          </div>
-          <div className="font-mono text-2xl font-bold text-slate-900 dark:text-white tabular-nums">
-            {secondsLeft !== null ? formatTime(secondsLeft) : `${String(timerMinutes).padStart(2, '0')}:00`}
-          </div>
-          <div className="flex gap-2">
-            {secondsLeft === null && (
-              <button onClick={startTimer} className="bg-emerald-700 hover:bg-emerald-600 text-white font-mono text-xs font-bold px-4 py-2 rounded-lg transition-colors">Start</button>
-            )}
-            {secondsLeft !== null && secondsLeft > 0 && timerRunning && (
-              <button onClick={pauseTimer} className="bg-amber-600 hover:bg-amber-700 text-white font-mono text-xs font-bold px-4 py-2 rounded-lg transition-colors">Pause</button>
-            )}
-            {secondsLeft !== null && secondsLeft > 0 && !timerRunning && (
-              <button onClick={resumeTimer} className="bg-emerald-700 hover:bg-emerald-600 text-white font-mono text-xs font-bold px-4 py-2 rounded-lg transition-colors">Resume</button>
-            )}
-            {secondsLeft !== null && (
-              <button onClick={resetTimer} className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-mono text-xs font-bold px-4 py-2 rounded-lg transition-colors">Reset</button>
-            )}
-          </div>
-          {secondsLeft === 0 && <span className="text-xs font-mono font-bold text-red-600 dark:text-red-400">⏰ Time's up</span>}
-        </div>
       </div>
 
       {/* Bulk diagnostic generation — reuses the existing, already-working
@@ -197,6 +144,8 @@ export const DiagnosticTestPanel: React.FC<DiagnosticTestPanelProps> = ({ studen
           ))}</div>
         </div>
       </div>
+
+      <FLNLevelReferenceModal isOpen={showLevelRef} onClose={() => setShowLevelRef(false)} />
     </div>
   );
 };

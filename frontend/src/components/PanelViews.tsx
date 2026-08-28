@@ -26,7 +26,6 @@ import { ContentPanel } from './panels/ContentPanel';
 import { DistrictsPanel } from './panels/DistrictsPanel';
 import { BlocksPanel } from './panels/BlocksPanel';
 import { AnalyticsPanel } from './panels/AnalyticsPanel';
-import { ReportsPanel } from './panels/ReportsPanel';
 import { StudentProfilePanel } from './panels/StudentProfilePanel';
 
 interface PanelViewsProps {
@@ -46,7 +45,7 @@ const CONTENT_ITEMS = [
 
 export const PanelViews: React.FC<PanelViewsProps> = ({ activePanel, currentUser, token }) => {
   const {
-    students, schools, usersList, reportsList, worksheetsList, teachersList,
+    students, studentsLoading, schools, usersList, reportsList, worksheetsList, teachersList,
     getDistrictStats, getBlockStats, updateStudentLocally, refreshStudents,
   } = usePanelData(token, currentUser, activePanel);
 
@@ -57,6 +56,7 @@ export const PanelViews: React.FC<PanelViewsProps> = ({ activePanel, currentUser
     return (
       <StudentListPanel
         students={students}
+        studentsLoading={studentsLoading}
         currentUser={currentUser}
         token={token}
         refreshStudents={refreshStudents}
@@ -64,7 +64,7 @@ export const PanelViews: React.FC<PanelViewsProps> = ({ activePanel, currentUser
     );
   }
 
-  if (panel === 'student_profile') return <StudentProfilePanel students={students} schools={schools} reportsList={reportsList} currentUser={currentUser} token={token} updateStudentLocally={updateStudentLocally} />;
+  if (panel === 'student_profile') return <StudentProfilePanel students={students} studentsLoading={studentsLoading} schools={schools} reportsList={reportsList} worksheetsList={worksheetsList} currentUser={currentUser} token={token} updateStudentLocally={updateStudentLocally} />;
 
   if (panel === 'diagnostic_test') return <DiagnosticTestPanel students={students} currentUser={currentUser} token={token} refreshStudents={refreshStudents} />;
 
@@ -72,11 +72,10 @@ export const PanelViews: React.FC<PanelViewsProps> = ({ activePanel, currentUser
 
   if (panel === 'test_history') return <TestHistoryPanel currentUser={currentUser} token={token} />;
 
-  if (panel === 'worksheets') return <WorksheetsPanel reportsList={reportsList} worksheetsList={worksheetsList} />;
+  if (panel === 'worksheets') return <WorksheetsPanel reportsList={reportsList} worksheetsList={worksheetsList} students={students} currentUser={currentUser} token={token} refreshStudents={refreshStudents} />;
 
   if (panel === 'performance') return <PerformancePanel students={students} currentUser={currentUser} />;
 
-  if (panel === 'reports') return <ReportsPanel currentUser={currentUser} schools={schools} students={students} reportsList={reportsList} />;
 
   // ===================== VOLUNTEER PANELS =====================
   if (panel === 'assigned_schools') return <AssignedSchoolsPanel schools={schools} students={students} />;

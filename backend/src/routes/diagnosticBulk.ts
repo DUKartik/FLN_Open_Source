@@ -44,8 +44,33 @@ export function registerDiagnosticBulkRoutes(app: express.Express) {
       paperStudents = reqStudents;
       paperCount = reqStudents.length;
     } else {
-      // Automatically fetch real enrolled students for this class from MongoDB
-      const allDbStudents = await dbStore.getStudents();
+      // Automatically fetch real enrolled students for this class — scoped
+      // to the requesting user's own school(s), same as every other
+      // role-scoped route in this app. The real frontend
+      // (BulkDiagnosticWorkflow.tsx) always sends an explicit `students`
+      // array pre-fetched from the scoped /api/students, so this branch is
+      // only reachable via a direct API call that omits it — caught while
+      // testing #304's fix, where an unscoped fetch here returned every
+      // Class-N student nationwide (28,813 for one real class number)
+      // instead of the caller's own roster. A 5000-set ceiling downstream
+      // stopped it from actually generating anything, but the query itself
+      // had no business reading outside the caller's scope in the first
+      // place — not otherwise reachable by a real user today, but
+      // defense-in-depth against a future caller of this branch.
+      let scopedSchoolIds: string[] | undefined;
+      if (user.role === UserRole.TEACHER || user.role === UserRole.SCHOOL) {
+        scopedSchoolIds = user.schoolId ? [user.schoolId] : [];
+      } else if (user.role === UserRole.VOLUNTEER) {
+        scopedSchoolIds = user.assignedSchools || [];
+      } else if (user.role === UserRole.BLOCK_ADMIN) {
+        const schools = await dbStore.getSchools();
+        scopedSchoolIds = schools.filter(s => s.blockCode === user.blockCode).map(s => s.id);
+      }
+      // SUPERADMIN/ADMIN/DISTRICT_ADMIN: no scope restriction here — they
+      // already receive unrestricted authorization below (line ~93-ish),
+      // same as the rest of this route's role tiering.
+
+      const allDbStudents = await dbStore.getStudents(scopedSchoolIds ? { schoolId: scopedSchoolIds } : undefined);
       const targetClassName = `Class ${classNumber}`;
       const enrolled = allDbStudents.filter(s => {
         const cg = (s.classGroup || '').toLowerCase().trim();
@@ -272,23 +297,48 @@ export function registerDiagnosticBulkRoutes(app: express.Express) {
   });
 
   // Get stored student diagnostic answer key from MongoDB
-  app.get('/api/diagnostic/student/:studentId/answer-key', async (req, res) => {
-    const user = getAuthUser(req);
-    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+    app.get('/api/diagnostic/student/:studentId/answer-key', async (req, res) => {
+      const user = getAuthUser(req);
+      if (!user) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { studentId } = req.params;
-    const { jobId } = req.query;
+      const { studentId } = req.params;
+      const { jobId } = req.query;
 
-    try {
-      const answerKey = await dbStore.getStudentDiagnosticAnswerKey(studentId, jobId as string);
-      if (!answerKey) {
-        return res.status(404).json({ error: 'Diagnostic answer key not found for this student.' });
+      try {
+        const answerKey = await dbStore.getStudentDiagnosticAnswerKey(studentId, jobId as string);
+        if (!answerKey) {
+          return res.status(404).json({ error: 'Diagnostic answer key not found for this student.' });
+        }
+        res.json(answerKey);
+      } catch (err: any) {
+        res.status(500).json({ error: err?.message || 'Failed to retrieve answer key.' });
       }
-      res.json(answerKey);
-    } catch (err: any) {
-      res.status(500).json({ error: err?.message || 'Failed to retrieve answer key.' });
-    }
-  });
+    });
+
+    // Get the most recently generated diagnostic answer key for an entire
+    // class. Used by the ICR single-sheet scan flow when no specific student
+    // is selected (e.g. a teacher scans one sheet and the OCR needs to know
+    // what the correct answers were). The class paper is shared across
+    // students up to per-student randomization, so this is a safe proxy.
+    app.get('/api/diagnostic/class/:classNumber/answer-key', async (req, res) => {
+      const user = getAuthUser(req);
+      if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+      const classNumber = parseInt(req.params.classNumber, 10);
+      if (!Number.isFinite(classNumber) || classNumber < 1) {
+        return res.status(400).json({ error: 'Invalid class number.' });
+      }
+
+      try {
+        const answerKey = await dbStore.getLatestClassAnswerKey(classNumber);
+        if (!answerKey) {
+          return res.status(404).json({ error: `No diagnostic answer key found for class ${classNumber}.` });
+        }
+        res.json(answerKey);
+      } catch (err: any) {
+        res.status(500).json({ error: err?.message || 'Failed to retrieve class answer key.' });
+      }
+    });
 
   // Generate diagnostic for a single student (enhanced with PDF download)
   app.post('/api/diagnostic/single', async (req, res) => {

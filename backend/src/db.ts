@@ -383,10 +383,21 @@ export interface EvaluationReport {
   // correcting, since a correction is meaningless without knowing which
   // question is being corrected.
   questionResults?: { questionId: string; question?: string; correctAnswer?: string; submittedAnswer: string; isCorrect: boolean }[];
-  teacherReviewed?: boolean;
-  reviewedBy?: string; // reviewing teacher's email
-  reviewedAt?: string;
-}
+    teacherReviewed?: boolean;
+    reviewedBy?: string; // reviewing teacher's email
+    reviewedAt?: string;
+    // Per-level pass/fail breakdown for diagnostic reports — the diagnostic
+    // intentionally does NOT assign a placement level (we are heading toward
+    // analytics & reports, which read these instead). Populated wherever the
+    // grading code knows the per-question source_level.
+    passedLevels?: number[];
+    failedLevels?: number[];
+    // Skills the student is struggling with — conceptIds of the failed levels
+    // plus any direct prerequisites (so the panel can show "you have gaps in
+    // Number Sense: Counting 6-10"). Drives the status text in the diagnostic
+    // panel instead of the old hardcoded "Verified & Certified".
+    skillGaps?: { conceptId: string; level: number; levelTitle: string; strand: string }[];
+  }
 
 export interface Ticket {
   id: string;
@@ -512,9 +523,9 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   announcements: 'announcements',
   interventions: 'interventions',
   bestPractices: 'best_practices',
-  diagnosticAnswerKeys: 'diagnostic_answer_keys',
-  testHistory: 'testHistory',
-};
+    diagnosticAnswerKeys: 'diagnostic_answer_keys',
+    testHistory: 'testHistory',
+  };
 
 /**
  * Aadhaar-sensitive fields that may ONLY be written by the tokenized creation
@@ -536,6 +547,48 @@ const AADHAAR_PROTECTED_UPDATE_FIELDS: readonly string[] = [
   'aadhaarIdentityId',
   'aadharMasked',
 ];
+
+/**
+ * Collapse multiple `Question` rows that share the same `question_id` into a
+ * single row, comma-joining their `answer` values so no information is lost.
+ *
+ * The diagnostic paper can be assembled from several sources (cached
+ * `assignedDiagnosticQuestions`, the freshly-generated class paper, the
+ * `questionBank` collection). When those paths overlap the same question
+ * can appear more than once. Without deduping, the OCR scan would treat
+ * the duplicate as a separate row, inflate the total count, and silently
+ * double-count correct/incorrect in the donut.
+ *
+ * Behavior:
+ *   - First occurrence of each `question_id` wins for the metadata fields
+ *     (conceptId, source_level, topic, ...).
+ *   - Subsequent duplicates contribute their `answer` value to a comma-
+ *     separated list on the merged row (de-duplicated within the join so
+ *     the same answer string isn't repeated).
+ *   - Order of the original list is preserved (first-seen order), so
+ *     downstream iteration matches the paper the student was actually shown.
+ */
+export function dedupeQuestionsById(questions: Question[]): Question[] {
+  const byId = new Map<string, Question>();
+  const order: string[] = [];
+  for (const q of questions) {
+    const id = q.question_id;
+    if (!id) continue;
+    if (!byId.has(id)) {
+      order.push(id);
+      byId.set(id, { ...q });
+      continue;
+    }
+    const existing = byId.get(id)!;
+    const parts = new Set<string>();
+    const existingParts = String(existing.answer ?? '').split(',').map(s => s.trim()).filter(Boolean);
+    existingParts.forEach(p => parts.add(p));
+    const incoming = String(q.answer ?? '').split(',').map(s => s.trim()).filter(Boolean);
+    incoming.forEach(p => parts.add(p));
+    existing.answer = Array.from(parts).join(', ');
+  }
+  return order.map(id => byId.get(id)!);
+}
 
 export class DBStore {
   private data: DatabaseSchema | null = null;
@@ -1074,27 +1127,27 @@ export class DBStore {
   }
 
   async getStudentAssignedQuestions(studentId: string, classNumber: number = 2): Promise<Question[]> {
-    let student: Student | null = null;
-    if (this.mongoDb) {
-      student = await this.mongoDb.collection<Student>('students').findOne({ id: studentId });
+      let student: Student | null = null;
+      if (this.mongoDb) {
+        student = await this.mongoDb.collection<Student>('students').findOne({ id: studentId });
+      }
+      if (!student && this.data && this.data.students) {
+        student = this.data.students.find(s => s.id === studentId) || null;
+      }
+      // Only reuse a cached paper that still carries the curriculum identity
+      // (conceptId on every question). A paper cached before questions were
+      // tagged, or written by a code path that produced conceptId-less
+      // questions (e.g. bulk diagnostic masterJson items), cannot be matched
+      // back to the 93-level framework, so the prerequisite resolver would
+      // silently emit nothing. Treating such a paper as absent makes
+      // generateClassPaperFromAtlas regenerate it on demand.
+      const cached = student?.assignedDiagnosticQuestions;
+      if (cached && cached.length > 0 && cached.every(q => q.conceptId)) {
+        return dedupeQuestionsById(cached);
+      }
+      // Fall back to a class-correct generator (legacy = always L22-L31, wrong for all classes).
+      return await this.generateClassPaperFromAtlas(studentId, classNumber);
     }
-    if (!student && this.data && this.data.students) {
-      student = this.data.students.find(s => s.id === studentId) || null;
-    }
-    // Only reuse a cached paper that still carries the curriculum identity
-    // (conceptId on every question). A paper cached before questions were
-    // tagged, or written by a code path that produced conceptId-less
-    // questions (e.g. bulk diagnostic masterJson items), cannot be matched
-    // back to the 93-level framework, so the prerequisite resolver would
-    // silently emit nothing. Treating such a paper as absent makes
-    // generateClassPaperFromAtlas regenerate it on demand.
-    const cached = student?.assignedDiagnosticQuestions;
-    if (cached && cached.length > 0 && cached.every(q => q.conceptId)) {
-      return cached;
-    }
-    // Fall back to a class-correct generator (legacy = always L22-L31, wrong for all classes).
-    return await this.generateClassPaperFromAtlas(studentId, classNumber);
-  }
 
   async getAnswerSubmissions() {
     if (this.mongoDb) return await this.mongoDb.collection<AnswerSubmission>('answerSubmissions').find({}).toArray();
@@ -1328,6 +1381,48 @@ export class DBStore {
     return student;
   }
 
+  // Only the original seed data ever populated the `classes` collection —
+  // registering a student (single or bulk-import) creates a Student record
+  // tagged with a classGroup/section, but nothing was ever creating the
+  // matching ClassGroup document those classGroup/section strings imply.
+  // Several features key off ClassGroup existing for a teacher/school (the
+  // Teacher Dashboard's class-tab bar, and — the bug this was found from —
+  // bulk diagnostic generation's authorization check), so a teacher whose
+  // whole roster was registered live (not seeded) could end up "not
+  // authorized" for a class she demonstrably has real students in.
+  // Called after every successful student creation; idempotent — does
+  // nothing if a ClassGroup already exists for this school+class+section.
+  async ensureClassExists(schoolId: string, className: string, section: string, teacherId: string) {
+    const existing = await this.getClasses();
+    if (existing.some(c => c.schoolId === schoolId && c.className === className && c.section === section)) {
+      return;
+    }
+    const newClass: ClassGroup = {
+      id: 'c_' + schoolId + '_' + className.replace(/\s+/g, '') + '_' + section,
+      schoolId,
+      className,
+      section,
+      teacherId,
+    };
+    if (this.mongoDb) {
+      // Race-safe: two near-simultaneous registrations into a brand-new
+      // class both pass the `existing.some(...)` check above before either
+      // has inserted. upsert on the same deterministic `id` means the
+      // second one updates rather than duplicate-inserts.
+      await this.mongoDb.collection('classes').updateOne(
+        { id: newClass.id },
+        { $setOnInsert: newClass },
+        { upsert: true }
+      );
+    }
+    if (this.data) {
+      if (!this.data.classes.some(c => c.id === newClass.id)) {
+        this.data.classes.push(newClass);
+      }
+      if (!this.mongoDb) await this.save();
+    }
+  }
+
   async updateStudent(studentId: string, updates: Partial<Student>) {
     // Defense-in-depth (Phase 2 hardening): routes whitelist their fields
     // today, but this mutator accepts any Partial<Student>. Aadhaar identity
@@ -1553,14 +1648,31 @@ export class DBStore {
   }
 
   async getStudentDiagnosticAnswerKey(studentId: string, jobId?: string): Promise<DiagnosticAnswerKey | null> {
-    if (this.mongoDb) {
-      const query: any = { studentId };
-      if (jobId) query.jobId = jobId;
-      return await this.mongoDb.collection<DiagnosticAnswerKey>('diagnostic_answer_keys').findOne(query, { sort: { createdAt: -1 } });
+      if (this.mongoDb) {
+        const query: any = { studentId };
+        if (jobId) query.jobId = jobId;
+        return await this.mongoDb.collection<DiagnosticAnswerKey>('diagnostic_answer_keys').findOne(query, { sort: { createdAt: -1 } });
+      }
+      const keys = (this.data?.diagnosticAnswerKeys || []).filter(k => k.studentId === studentId && (!jobId || k.jobId === jobId));
+      return keys[keys.length - 1] || null;
     }
-    const keys = (this.data?.diagnosticAnswerKeys || []).filter(k => k.studentId === studentId && (!jobId || k.jobId === jobId));
-    return keys[keys.length - 1] || null;
-  }
+
+    // Fetch the latest diagnostic answer key for any student in a given class —
+    // used when a single sheet scan is performed without a specific student
+    // selected (the OCR can't ask "which student", so it grabs the most
+    // recently generated paper for that class). All students in the same class
+    // get the same paper up to per-student randomization, so this is a safe
+    // approximation when no per-student answer key is available.
+    async getLatestClassAnswerKey(classNumber: number): Promise<DiagnosticAnswerKey | null> {
+      if (this.mongoDb) {
+        return await this.mongoDb.collection<DiagnosticAnswerKey>('diagnostic_answer_keys')
+          .findOne({ classNumber }, { sort: { createdAt: -1 } });
+      }
+      const keys = (this.data?.diagnosticAnswerKeys || [])
+        .filter(k => k.classNumber === classNumber)
+        .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+      return keys[0] || null;
+    }
 
   // --- Preloaded Question Pool (Mathematical Curriculum Questions Classes 2-4) ---
   private getSeedQuestions(): Question[] {

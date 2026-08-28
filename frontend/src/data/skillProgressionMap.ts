@@ -329,25 +329,73 @@ export const CORE_SKILLS: CoreSkill[] = [
 export interface LevelSkillMapping {
   levelId: string;
   levelNumber: number;
+  /**
+   * The same level's identifier in the research docs' S-notation
+   * (`Research/fln_level_networks.md`, `Research/fln_proposed_levels.md`),
+   * e.g. "S3.5". Derived, not hand-maintained — see sCodeFor() below.
+   * Issue #280: this is the "make the mapping available to the code" ask.
+   * Which notation is canonical long-term is a separate, deliberate naming
+   * decision (issue #280 ask #3) that hasn't been made — both IDs coexist
+   * here so nothing has to be renamed (and no student-response history
+   * orphaned) before that decision happens.
+   */
+  sCode: string;
   capability: string;
   stage: 'Pre-school 1' | 'Pre-school 2' | 'Pre-school 3'
        | 'Class 1' | 'Class 2' | 'Class 3' | 'Class 4';
   primarySkills: string[];     // SK IDs
   supportingSkills: string[];  // SK IDs
-  prerequisites: string[];     // levelIds (conservative — only set when required_for_procedure)
-  relationshipType: RelationshipType;
+  prerequisites: Prerequisite[];
   questionTypes: string[];
   evidence: string[];
 }
 
+/**
+ * Issue #277: a level's prerequisites can genuinely differ in strength from
+ * each other (e.g. L53 depends on L36 more loosely than it depends on L37) —
+ * the relationship type lives on the edge, not on the whole level, so mixed
+ * strength can actually be expressed. `rationale` gives somewhere to record
+ * *why* an edge is typed the way it is; per the issue, an edge with no
+ * stated rationale shouldn't be typed as a hard prerequisite
+ * (`required_for_procedure`) — the diagnostic paper's apex-selection
+ * inference only holds across genuinely hard edges, so an unjustified one
+ * silently over-claims what testing the apex level actually proves.
+ */
+export interface Prerequisite {
+  levelId: string;
+  relationshipType: RelationshipType;
+  rationale?: string;
+}
+
+// Cumulative level counts per S-notation stage (S1..S7): 7, 10, 10, 15, 19,
+// 14, 18 — sums to 93. Both stageFor() and sCodeFor() derive from this same
+// array so the two notations can't drift relative to each other by
+// construction. Verified to reproduce all 93 rows of
+// Research/fln_L_to_S_crosswalk.json exactly — see
+// scripts/check-level-notation-drift.ts.
+const STAGE_CUMULATIVE_BOUNDARIES = [7, 17, 27, 42, 61, 75, 93] as const;
+
+function stageIndexFor(n: number): number {
+  for (let i = 0; i < STAGE_CUMULATIVE_BOUNDARIES.length; i++) {
+    if (n <= STAGE_CUMULATIVE_BOUNDARIES[i]) return i + 1; // 1-indexed: S1..S7
+  }
+  throw new Error(`Level ${n} is outside the 93-level range (1-93).`);
+}
+
+/** The n-th S-code in stage-then-index order, e.g. sCodeFor(28) === "S4.1". */
+function sCodeFor(n: number): string {
+  const stageIdx = stageIndexFor(n);
+  const prevBoundary = stageIdx === 1 ? 0 : STAGE_CUMULATIVE_BOUNDARIES[stageIdx - 2];
+  const withinStageIdx = n - prevBoundary;
+  return `S${stageIdx}.${withinStageIdx}`;
+}
+
 function stageFor(n: number): LevelSkillMapping['stage'] {
-  if (n <= 7)  return 'Pre-school 1';
-  if (n <= 17) return 'Pre-school 2';
-  if (n <= 27) return 'Pre-school 3';
-  if (n <= 42) return 'Class 1';
-  if (n <= 61) return 'Class 2';
-  if (n <= 75) return 'Class 3';
-  return 'Class 4';
+  const names: LevelSkillMapping['stage'][] = [
+    'Pre-school 1', 'Pre-school 2', 'Pre-school 3',
+    'Class 1', 'Class 2', 'Class 3', 'Class 4',
+  ];
+  return names[stageIndexFor(n) - 1];
 }
 
 // Format helpers for evidence/question types — kept inline so we don't drift
@@ -362,8 +410,26 @@ function qtL(l: number): string[] {
 // (Earlier hand-written L1-L27 mapping has been replaced by spec §4. The shape
 // and the dashboard button location are preserved.)
 
+// Issue #277: every existing call site below sets `prerequisites` as a plain
+// levelId array plus one shared `relationshipType` — because until now that
+// was the only way to say it. That shape stays valid as a shorthand (most
+// levels genuinely do have uniform-strength prerequisites and there's no
+// reason to force verbosity where it isn't needed) but is normalized here
+// into real per-edge Prerequisite objects, so the *data* is per-edge even
+// where the *authoring* isn't. A call site that does need mixed strength
+// (e.g. applying #278's corrections) can pass `Prerequisite[]` directly
+// instead, per-edge, bypassing the shorthand for just that level.
+function normalizePrerequisites(
+  prereqs: (string | Prerequisite)[] | undefined,
+  defaultType: RelationshipType
+): Prerequisite[] {
+  return (prereqs ?? []).map(p =>
+    typeof p === 'string' ? { levelId: p, relationshipType: defaultType } : p
+  );
+}
+
 function makeLevel(n: number, capability: string, primary: string[], supporting: string[], opts: {
-  prerequisites?: string[];
+  prerequisites?: (string | Prerequisite)[];
   relationshipType?: RelationshipType;
   questionTypes?: string[];
   evidence?: string[];
@@ -371,12 +437,12 @@ function makeLevel(n: number, capability: string, primary: string[], supporting:
   return {
     levelId: `L${n}`,
     levelNumber: n,
+    sCode: sCodeFor(n),
     capability,
     stage: stageFor(n),
     primarySkills: primary,
     supportingSkills: supporting,
-    prerequisites: opts.prerequisites ?? [],
-    relationshipType: opts.relationshipType ?? 'often_precedes',
+    prerequisites: normalizePrerequisites(opts.prerequisites, opts.relationshipType ?? 'often_precedes'),
     questionTypes: opts.questionTypes ?? qtL(n),
     evidence: opts.evidence ?? [],
   };
@@ -616,6 +682,7 @@ export const LEVEL_SKILL_MAP: LevelSkillMapping[] = [
 
 const SKILL_BY_ID: Record<string, CoreSkill> = Object.fromEntries(CORE_SKILLS.map(s => [s.id, s]));
 const LEVEL_BY_ID: Record<string, LevelSkillMapping> = Object.fromEntries(LEVEL_SKILL_MAP.map(l => [l.levelId, l]));
+const LEVEL_BY_SCODE: Record<string, LevelSkillMapping> = Object.fromEntries(LEVEL_SKILL_MAP.map(l => [l.sCode, l]));
 
 (function sanity(): void {
   for (const lvl of LEVEL_SKILL_MAP) {
@@ -625,8 +692,8 @@ const LEVEL_BY_ID: Record<string, LevelSkillMapping> = Object.fromEntries(LEVEL_
       }
     }
     for (const pre of lvl.prerequisites) {
-      if (!LEVEL_BY_ID[pre]) {
-        throw new Error(`Level ${lvl.levelId} references unknown prereq level ${pre}`);
+      if (!LEVEL_BY_ID[pre.levelId]) {
+        throw new Error(`Level ${lvl.levelId} references unknown prereq level ${pre.levelId}`);
       }
     }
   }
@@ -636,11 +703,20 @@ const LEVEL_BY_ID: Record<string, LevelSkillMapping> = Object.fromEntries(LEVEL_
   if (Object.keys(SKILL_BY_ID).length !== 24) {
     throw new Error(`Expected 24 core skills, got ${Object.keys(SKILL_BY_ID).length}`);
   }
+  if (Object.keys(LEVEL_BY_SCODE).length !== 93) {
+    throw new Error(`Expected 93 unique sCode values, got ${Object.keys(LEVEL_BY_SCODE).length} — a level's sCode collided with another's.`);
+  }
 })();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Derived aggregates
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Look up a level by its S-notation code (e.g. "S4.1") instead of its
+ * L-number. See LevelSkillMapping.sCode and issue #280. */
+export function getLevelBySCode(sCode: string): LevelSkillMapping | undefined {
+  return LEVEL_BY_SCODE[sCode];
+}
 
 export function getSkillsForLevel(levelId: string): CoreSkill[] {
   const lvl = LEVEL_BY_ID[levelId];
@@ -670,7 +746,7 @@ export function getPrerequisiteEdges(): Array<{ from: string; to: string; type: 
   const edges: Array<{ from: string; to: string; type: RelationshipType }> = [];
   for (const lvl of LEVEL_SKILL_MAP) {
     for (const pre of lvl.prerequisites) {
-      edges.push({ from: pre, to: lvl.levelId, type: lvl.relationshipType });
+      edges.push({ from: pre.levelId, to: lvl.levelId, type: pre.relationshipType });
     }
   }
   return edges;

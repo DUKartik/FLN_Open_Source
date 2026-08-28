@@ -6,14 +6,10 @@ import React, { useState, useEffect } from 'react';
 import { apiFetch, withBase } from '../../services/apiClient';
 import { User, Student, ClassGroup, DashboardProps } from '../../types';
 import { DiagnosticWorkflow } from '../DiagnosticWorkflow';
-import { BulkDiagnosticWorkflow } from '../BulkDiagnosticWorkflow';
-import { WorksheetWorkflow } from '../WorksheetWorkflow';
-import { IcrScanner } from '../IcrScanner';
 import { BaselineUpload } from '../BaselineUpload';
 import { SkillGraphPanel } from '../SkillGraphPanel';
 import { Table, Column } from '../Table';
-import { Layers as BulkIcon } from 'lucide-react';
-import { FLNLevelReferenceModal, LevelBadge } from '../RoleDashboards';
+import { LevelBadge } from '../RoleDashboards';
 
 
 export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) => {
@@ -23,23 +19,12 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
 
   const [diagnosticStudent, setDiagnosticStudent] = useState<Student | null>(null);
   const [baselineStudent, setBaselineStudent] = useState<Student | null>(null);
-  const [showWorksheetPortal, setShowWorksheetPortal] = useState(false);
-  const [showLevelRef, setShowLevelRef] = useState(false);
   const [showSkillGraph, setShowSkillGraph] = useState(false);
-  const [showIcrScanner, setShowIcrScanner] = useState(false);
-  const [showBulkDiagnostic, setShowBulkDiagnostic] = useState(false);
 
-  // Inline bulk generation state
-  const [bulkJob, setBulkJob] = useState<{ jobId: string; total: number; completed: number; status: string; pdfUrl: string; downloadUrl: string | null; error: string } | null>(null);
-  const [bulkLoading, setBulkLoading] = useState(false);
-  const [bulkError, setBulkError] = useState('');
-
-  // Level-wise bulk generation state
-  const [levelBulkProgress, setLevelBulkProgress] = useState<{ total: number; completed: number; errors: string[] } | null>(null);
-  const [levelBulkLoading, setLevelBulkLoading] = useState(false);
-
-
-
+  // Issue #166: per-student "Print L{level}.{sub}" action kept on the roster
+  // (it's a per-row interaction, not an operational tool). State below is the
+  // indicator banners + handler — same shape as before, just no longer paired
+  // with the now-removed bulk/level-batch cards.
   const [levelPdfLoading, setLevelPdfLoading] = useState(false);
   const [levelPdfError, setLevelPdfError] = useState('');
 
@@ -89,55 +74,6 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
     fetchVolunteerData();
   }, [token]);
 
-  // Poll bulk job progress
-  useEffect(() => {
-    if (!bulkJob || bulkJob.status !== 'running') return;
-    const interval = setInterval(async () => {
-      try {
-        const res = await apiFetch(`/api/diagnostic/bulk/${bulkJob.jobId}/progress`);
-        if (res.ok) {
-          const data = await res.json();
-          setBulkJob(prev => prev ? { ...prev, completed: data.completed, status: data.status, pdfUrl: data.pdfUrl || prev.pdfUrl, downloadUrl: data.downloadUrl || prev.downloadUrl, error: data.error || '' } : prev);
-          if (data.status !== 'running') clearInterval(interval);
-        } else {
-          clearInterval(interval);
-        }
-      } catch {
-        clearInterval(interval);
-      }
-    }, 1500);
-    return () => clearInterval(interval);
-  }, [bulkJob?.jobId, bulkJob?.status]);
-
-
-
-  if (showBulkDiagnostic) {
-    return (
-      <BulkDiagnosticWorkflow
-        user={user}
-        token={token}
-        userRole={user.role}
-        onBack={() => {
-          setShowBulkDiagnostic(false);
-          fetchVolunteerData();
-        }}
-      />
-    );
-  }
-
-  if (showIcrScanner) {
-    return (
-      <IcrScanner
-        token={token}
-        user={user}
-        onBack={() => {
-          setShowIcrScanner(false);
-          fetchVolunteerData();
-        }}
-      />
-    );
-  }
-
   if (diagnosticStudent) {
     return (
       <DiagnosticWorkflow
@@ -167,45 +103,6 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
 
   const classStudents = activeClass ? students.filter(s => s.classGroup === activeClass.className && s.section === activeClass.section) : [];
 
-  if (showWorksheetPortal) {
-    const effectiveClass = activeClass || (classes.length > 0 ? classes[0] : null);
-    if (effectiveClass) {
-      const effectiveStudents = students.filter(
-        s => s.classGroup === effectiveClass.className && s.section === effectiveClass.section
-      );
-      return (
-        <WorksheetWorkflow
-          classGroup={effectiveClass}
-          students={effectiveStudents}
-          token={token}
-          userRole={user.role}
-          onBack={() => {
-            setShowWorksheetPortal(false);
-            fetchVolunteerData();
-          }}
-        />
-      );
-    } else {
-      return (
-        <div className="p-8 max-w-md mx-auto bg-white dark:bg-slate-900 border border-zinc-200 dark:border-zinc-700 rounded-2xl shadow-sm text-center space-y-4 my-12" id="no-classes-fallback">
-          <div className="w-12 h-12 bg-red-50 dark:bg-red-950 text-red-600 dark:text-red-400 rounded-full flex items-center justify-center mx-auto">
-            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-            </svg>
-          </div>
-          <h3 className="font-display font-semibold text-zinc-950 dark:text-white text-base">No Classes Found</h3>
-          <p className="text-sm text-zinc-500 dark:text-zinc-400">You must have at least one registered classroom to open the Exam Worksheets Personalization Portal.</p>
-          <button
-            onClick={() => setShowWorksheetPortal(false)}
-            className="px-4 py-2 bg-zinc-950 text-white font-mono font-medium text-xs rounded-lg hover:bg-zinc-850 cursor-pointer animate-pulse"
-          >
-            Go Back
-          </button>
-        </div>
-      );
-    }
-  }
-
   return (
     <div className="space-y-6" id="volunteer-dashboard">
       {levelPdfLoading && (
@@ -225,12 +122,6 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
           <p className="text-zinc-550 dark:text-zinc-400 text-sm mt-0.5 font-medium">Volunteer: {user.name}</p>
         </div>
         <div className="flex gap-2">
-          <button
-            onClick={() => setShowLevelRef(true)}
-            className="bg-white dark:bg-slate-900 hover:bg-zinc-50 dark:hover:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-200 font-mono text-xs font-semibold px-4 py-2.5 rounded-lg transition-colors cursor-pointer"
-          >
-            📖 93 FLN Framework
-          </button>
           <button
             onClick={() => setShowSkillGraph(true)}
             className="bg-white dark:bg-slate-900 hover:bg-zinc-50 dark:hover:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-200 font-mono text-xs font-semibold px-4 py-2.5 rounded-lg transition-colors cursor-pointer"
@@ -259,193 +150,20 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
 
       {activeClass && (
         <div className="space-y-6">
-          {/* 📋 Diagnostic Paper Generator */}
-          <div className="bg-white dark:bg-slate-900 border border-zinc-200 dark:border-slate-700 rounded-xl p-5 shadow-sm space-y-4">
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-              <div>
-                <h3 className="font-display font-semibold text-zinc-900 dark:text-white text-sm">📋 Diagnostic Paper Generator</h3>
-                <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">Generate baseline diagnostic PDFs for students pending placement.</p>
-              </div>
-              <div className="flex items-center gap-3">
-                <span className="text-xs font-mono font-bold px-2 py-1 rounded bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 border border-amber-200 dark:border-amber-800">
-                  {classStudents.filter(s => s.levelHistory.length === 0).length} Pending
-                </span>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    const targets = classStudents.length > 0 ? classStudents : [];
-                    if (targets.length === 0) {
-                      alert('No students found in this class.');
-                      return;
-                    }
-                    const classMatch = activeClass?.className.match(/\d+/);
-                    const classNumber = classMatch ? parseInt(classMatch[0], 10) : 2;
-                    setBulkLoading(true);
-                    setBulkError('');
-                    setBulkJob(null);
-                    try {
-                      const res = await apiFetch('/api/diagnostic/bulk', {
-                        method: 'POST',
-                        headers: {
-                          'Content-Type': 'application/json',
-                          'Authorization': `Bearer ${token}`
-                        },
-                        body: JSON.stringify({ classNumber, students: targets.map(s => ({ name: s.name, studentId: s.id })) })
-                      });
-                      const data = await res.json();
-                      if (res.ok) {
-                        setBulkJob({ ...data, total: targets.length, completed: 0, pdfUrl: data.pdfUrl || '', downloadUrl: data.downloadUrl || null, error: '' });
-                      } else {
-                        setBulkError(data.error || 'Failed to start bulk generation.');
-                      }
-                    } catch {
-                      setBulkError('Network error starting bulk generation.');
-                    } finally {
-                      setBulkLoading(false);
-                    }
-                  }}
-                  disabled={bulkLoading || (bulkJob?.status === 'running')}
-                  className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs font-mono px-4 py-2.5 rounded-lg transition-colors cursor-pointer flex items-center gap-1.5 shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {bulkLoading ? (
-                    <><span className="animate-spin text-sm">⏳</span> Starting...</>
-                  ) : bulkJob?.status === 'running' ? (
-                    <><span className="animate-spin text-sm">⏳</span> Generating...</>
-                  ) : (
-                    <>Generate Diagnostic Papers</>
-                  )}
-                </button>
-              </div>
-            </div>
+          {/* Issue #166: Diagnostic Paper Generator + Level-Wise Paper Generator
+              + Exam Worksheets Engine cards removed from this dashboard. They
+              now live in:
+                - Assessment -> Diagnostic Test (BulkDiagnosticWorkflow + 93 FLN
+                  Framework modal — DiagnosticTestPanel.tsx)
+                - Worksheets (Level-Wise batch generator + Open Personalization
+                  Portal + ICR Answer Sheet Scanner launchers — WorksheetsPanel.tsx)
+              Per-row actions (Run Diagnostic, Upload Sheet, Print L…, 🌐
+              Interactive) remain because they are roster interactions, not
+              operational tools. */}
 
-            {/* Inline diagnostic bulk progress */}
-            {(bulkJob || bulkLoading || bulkError) && (
-              <div className="pt-2 border-t border-zinc-100 dark:border-zinc-800 space-y-3">
-                {bulkError && (
-                  <div className="p-3 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-lg text-xs text-red-700 dark:text-red-300">⚠️ {bulkError}</div>
-                )}
-                {bulkJob && (
-                  <>
-                    <div className="flex justify-between text-xs font-mono text-zinc-500 dark:text-zinc-400">
-                      <span>Progress: {bulkJob.completed} / {bulkJob.total} papers</span>
-                      <span className={`font-semibold ${bulkJob.status === 'running' ? 'text-blue-600 dark:text-blue-400' : bulkJob.status === 'completed' ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
-                        {bulkJob.status === 'running' ? 'Generating...' : bulkJob.status === 'completed' ? 'Ready' : 'Failed'}
-                      </span>
-                    </div>
-                    <div className="w-full bg-zinc-100 dark:bg-zinc-800 rounded-full h-2.5 overflow-hidden">
-                      <div className={`h-full rounded-full transition-all duration-500 ${bulkJob.status === 'completed' ? 'bg-green-500' : bulkJob.status === 'failed' ? 'bg-red-500' : 'bg-blue-500'}`}
-                        style={{ width: `${bulkJob.total > 0 ? Math.round((bulkJob.completed / bulkJob.total) * 100) : 0}%` }} />
-                    </div>
-                    {bulkJob.status === 'completed' && (
-                      <div className="flex gap-2 pt-1">
-                        <a
-                          href={bulkJob.pdfUrl ? withBase(bulkJob.pdfUrl) : bulkJob.downloadUrl ? withBase(bulkJob.downloadUrl) : '#'}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="inline-flex items-center gap-1.5 bg-green-600 hover:bg-green-700 text-white text-xs font-mono font-bold px-3 py-2 rounded-lg transition-colors cursor-pointer"
-                        >
-                          🖨️ Print / Open PDF ({bulkJob.total} Papers)
-                        </a>
-                      </div>
-                    )}
-                    {bulkJob.status === 'failed' && (
-                      <div className="p-2 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded text-xs text-red-700 dark:text-red-300">{bulkJob.error || 'Generation failed.'}</div>
-                    )}
-                  </>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* 📄 Level-Wise Paper Generator */}
-          <div className="bg-white dark:bg-slate-900 border border-zinc-200 dark:border-slate-700 rounded-xl p-5 shadow-sm space-y-4">
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-              <div>
-                <h3 className="font-display font-semibold text-zinc-900 dark:text-white text-sm">📄 Level-Wise Paper Generator</h3>
-                <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">Generate personalized level-wise question PDFs for placed students.</p>
-              </div>
-              <div className="flex items-center gap-3">
-                <span className="text-xs font-mono font-bold px-2 py-1 rounded bg-green-50 dark:bg-green-950/40 text-green-700 dark:text-green-400 border border-green-200 dark:border-green-800">
-                  {classStudents.filter(s => s.levelHistory.length > 0).length} Placed
-                </span>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    const placed = classStudents.filter(s => s.levelHistory.length > 0);
-                    if (placed.length === 0) {
-                      alert('No placed students in this class to generate level-wise papers for.');
-                      return;
-                    }
-
-                    setLevelBulkLoading(true);
-                    setLevelBulkProgress({ total: placed.length, completed: 0, errors: [] });
-                    try {
-                      const res = await apiFetch('/api/worksheets/generate-level-batch', {
-                        method: 'POST',
-                        headers: {
-                          'Content-Type': 'application/json',
-                          'Authorization': `Bearer ${token}`
-                        },
-                        body: JSON.stringify({ studentIds: placed.map(s => s.id) })
-                      });
-                      const data = await res.json();
-                      if (!res.ok || !data.success) {
-                        throw new Error(data.error || 'Batch generation failed.');
-                      }
-                      for (const result of data.results || []) {
-                        window.open(withBase(result.pdfUrl), '_blank');
-                      }
-                      setLevelBulkProgress({ total: placed.length, completed: placed.length, errors: [] });
-                    } catch (err: any) {
-                      setLevelBulkProgress({ total: placed.length, completed: 0, errors: [err.message || 'Network error'] });
-                    } finally {
-                      setLevelBulkLoading(false);
-                    }
-                  }}
-                  disabled={levelBulkLoading}
-                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs font-mono px-4 py-2.5 rounded-lg transition-colors cursor-pointer flex items-center gap-1.5 shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {levelBulkLoading ? (
-                    <><span className="animate-spin text-sm">⏳</span> Generating...</>
-                  ) : (
-                    <>Generate Level-Wise Papers</>
-                  )}
-                </button>
-              </div>
-            </div>
-
-            {/* Inline level-wise progress */}
-            {levelBulkProgress && (
-              <div className="pt-2 border-t border-zinc-100 dark:border-zinc-800 space-y-3">
-                <div className="flex justify-between text-xs font-mono text-zinc-500 dark:text-zinc-400">
-                  <span>Progress: {levelBulkProgress.completed} / {levelBulkProgress.total} papers</span>
-                  <span className={`font-semibold ${levelBulkLoading ? 'text-blue-600 dark:text-blue-400' : 'text-green-600 dark:text-green-400'}`}>
-                    {levelBulkLoading ? 'Generating...' : 'Done'}
-                  </span>
-                </div>
-                <div className="w-full bg-zinc-100 dark:bg-zinc-800 rounded-full h-2.5 overflow-hidden">
-                  <div className={`h-full rounded-full transition-all duration-500 ${!levelBulkLoading ? 'bg-green-500' : 'bg-blue-500'}`}
-                    style={{ width: `${levelBulkProgress.total > 0 ? Math.round((levelBulkProgress.completed / levelBulkProgress.total) * 100) : 0}%` }} />
-                </div>
-                {levelBulkProgress.errors.length > 0 && (
-                  <div className="p-2 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded text-xs text-red-700 dark:text-red-300">
-                    Errors: {levelBulkProgress.errors.join('; ')}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
-          <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-          <div className="xl:col-span-2 bg-white dark:bg-slate-900 border border-zinc-200 dark:border-slate-700 rounded-xl shadow-sm overflow-hidden">
+          <div className="bg-white dark:bg-slate-900 border border-zinc-200 dark:border-slate-700 rounded-xl shadow-sm overflow-hidden">
             <div className="p-4 border-b border-zinc-150 dark:border-zinc-800 flex justify-between items-center bg-zinc-50/50 dark:bg-zinc-800/50">
               <h3 className="font-display font-medium text-zinc-900 dark:text-white text-sm">Classroom Student Roster ({classStudents.length})</h3>
-              <button
-                onClick={() => setShowWorksheetPortal(true)}
-                className="bg-white dark:bg-slate-800 hover:bg-zinc-50 dark:hover:bg-zinc-700 border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 font-mono text-[10px] font-bold px-3 py-1.5 rounded-lg shadow-sm cursor-pointer hover:border-zinc-400 transition-colors"
-              >
-                Trigger Worksheets Flow
-              </button>
             </div>
             <div className="p-4">
               {(() => {
@@ -508,38 +226,8 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
               })()}
             </div>
           </div>
-
-          <div className="xl:col-span-1 space-y-4">
-            <div className="bg-white dark:bg-slate-900 p-5 border border-zinc-200 dark:border-slate-700 rounded-xl shadow-sm space-y-4">
-              <h4 className="font-display font-medium text-zinc-900 dark:text-white text-sm">Exam Worksheets Engine</h4>
-              <p className="text-xs text-zinc-500 dark:text-zinc-400 leading-relaxed">
-                Trigger class-wide personalized mathematics worksheets or grade submitted solution sheets using ICR scanner integrations.
-              </p>
-              <button
-                onClick={() => setShowBulkDiagnostic(true)}
-                className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-mono font-semibold text-xs py-3 rounded-lg transition-colors shadow cursor-pointer flex items-center justify-center gap-2"
-              >
-                <BulkIcon className="w-4 h-4" />
-                Bulk Diagnostic Generator
-              </button>
-              <button
-                onClick={() => setShowWorksheetPortal(true)}
-                className="w-full bg-zinc-950 text-white font-mono font-semibold text-xs py-3 rounded-lg hover:bg-zinc-850 transition-colors shadow cursor-pointer animate-pulse"
-              >
-                Open Personalization Portal
-              </button>
-              <button
-                onClick={() => setShowIcrScanner(true)}
-                className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-mono font-semibold text-xs py-3 rounded-lg transition-colors shadow cursor-pointer"
-              >
-                ICR Answer Sheet Scanner
-              </button>
-            </div>
-          </div>
         </div>
-      </div>
       )}
-      <FLNLevelReferenceModal isOpen={showLevelRef} onClose={() => setShowLevelRef(false)} />
       <SkillGraphPanel open={showSkillGraph} onClose={() => setShowSkillGraph(false)} />
     </div>
   );

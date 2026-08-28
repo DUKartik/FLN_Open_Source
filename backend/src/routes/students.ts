@@ -7,7 +7,7 @@ import { generateDiagnosticPaper } from '../paperGenerator';
 import { generateQuestionsForLevel } from '../levelGenerator';
 import { evaluateAIDiagnostic } from '../gemini';
 import { AI_SERVICES_DIR, PYTHON_BIN } from '../config';
-import { resolvePrerequisites, describeConcept } from '../competencyPrerequisites';
+import { resolvePrerequisites, describeConcept, directPrerequisites } from '../competencyPrerequisites';
 import { CURRICULUM_MAPPING } from '../config/curriculumMap';
 import { computeStudentDisplayId } from '../displayId';
 import { tokenizeAadhaar, formatAadhaarMask, AadhaarVaultTokenizeResult } from '../aadhaarVault';
@@ -287,6 +287,12 @@ export function registerStudentRoutes(app: express.Express) {
     }
 
     await dbStore.addStudent(newStudent);
+    // Issue: bulk diagnostic generation ("not authorized for Class N")
+    // traced back to no ClassGroup document ever being created for
+    // live-registered classes — only the seed data had one. Ensure it
+    // exists now so class-tabs, bulk-diagnostic authorization, etc. all
+    // work for this student's class going forward.
+    await dbStore.ensureClassExists(schoolId, trimmedClassGroup, trimmedSection, actingUser.id);
     // Track in-memory so bulk operations detect intra-batch duplicates too
     existingAadhars.add(rawAadhar);
     existingAadhars.add(aadhaarMask);
@@ -736,15 +742,58 @@ export function registerStudentRoutes(app: express.Express) {
     }
 
     const questionResults = questions.map((q) => {
-      const submitted = String(answers[q.question_id] ?? '').trim().toLowerCase();
-      const correct = q.answer.trim().toLowerCase();
-      return { q, isCorrect: submitted === correct };
-    });
-    const allCorrect = questionResults.every((r) => r.isCorrect);
+          const submitted = String(answers[q.question_id] ?? '').trim().toLowerCase();
+          const correct = q.answer.trim().toLowerCase();
+          return { q, isCorrect: submitted === correct, sourceLevel: q.source_level, conceptId: q.conceptId };
+        });
+        const allCorrect = questionResults.every((r) => r.isCorrect);
 
-    if (allCorrect && pipelineFailed) {
-      recommendedLevel = (classNumber - 1) * 10 + 1;
-    }
+        // Per-level breakdown for the diagnostic panel: distinct level numbers
+        // bucketed by pass/fail. De-duplicated with Set so multiple questions at
+        // the same level collapse to a single "L5 passed" / "L5 failed" entry.
+        const passedLevelSet = new Set<number>();
+        const failedLevelSet = new Set<number>();
+        for (const r of questionResults) {
+          const lvl = r.sourceLevel;
+          if (!Number.isFinite(lvl)) continue;
+          (r.isCorrect ? passedLevelSet : failedLevelSet).add(lvl);
+        }
+        const passedLevels = Array.from(passedLevelSet).sort((a, b) => a - b);
+        const failedLevels = Array.from(failedLevelSet).sort((a, b) => a - b);
+
+        // Skill gaps: pull conceptIds from every FAILED level, plus each of those
+        // concept's direct prerequisites (so the panel can show "you are also
+        // shaky on the foundation skills that feed into these"). De-duped by
+        // conceptId so each gap is listed once.
+        const skillGapMap = new Map<string, { conceptId: string; level: number; levelTitle: string; strand: string }>();
+        for (const lvl of failedLevels) {
+          const cfg = CURRICULUM_MAPPING[lvl];
+          if (!cfg) continue;
+          const desc = describeConcept(cfg.conceptId);
+          if (desc && !skillGapMap.has(desc.conceptId)) {
+            skillGapMap.set(desc.conceptId, desc);
+          }
+        }
+        // Direct prereqs of every failed concept — these are the foundation
+            // skills the student needs to remediate before re-attempting the failed
+            // levels. Use directPrerequisites() for the immediate one-hop edges
+            // (resolvePrerequisites() returns the full transitive closure, which
+            // would surface too many concepts and bury the real gaps).
+            for (const lvl of failedLevels) {
+              const cfg = CURRICULUM_MAPPING[lvl];
+              if (!cfg) continue;
+              for (const prereqId of directPrerequisites(cfg.conceptId)) {
+                const desc = describeConcept(prereqId);
+                if (desc && !skillGapMap.has(desc.conceptId)) {
+                  skillGapMap.set(desc.conceptId, desc);
+                }
+              }
+            }
+        const skillGaps = Array.from(skillGapMap.values()).sort((a, b) => a.level - b.level);
+
+        if (allCorrect && pipelineFailed) {
+          recommendedLevel = (classNumber - 1) * 10 + 1;
+        }
 
     // Update Student placing levels
     const levelHistory = [...student.levelHistory, {
@@ -1022,18 +1071,25 @@ export function registerStudentRoutes(app: express.Express) {
     }
 
     const report: EvaluationReport = {
-      id: 'rep_diag_' + Date.now(),
-      studentId: student.id,
-      worksheetId: 'diagnostic',
-      score,
-      totalQuestions: questions.length,
-      conceptMastery,
-      narrative,
-      recommendedLevel,
-      recommendedSubLevel: subLevel,
-      timestamp: new Date().toISOString(),
-      ...(reasoning ? { reasoning } : {}),
-    };
+          id: 'rep_diag_' + Date.now(),
+          studentId: student.id,
+          worksheetId: 'diagnostic',
+          score,
+          totalQuestions: questions.length,
+          conceptMastery,
+          narrative,
+          recommendedLevel,
+          recommendedSubLevel: subLevel,
+          timestamp: new Date().toISOString(),
+          // Per-level pass/fail breakdown — the diagnostic does not assign a
+          // placement level (intentional, per the new analytics-first model).
+          // The UI uses these to show which levels were demonstrated vs which
+          // need remediation, derived from the actual submitted answers.
+          passedLevels,
+          failedLevels,
+          skillGaps,
+          ...(reasoning ? { reasoning } : {}),
+        };
 
     await dbStore.addEvaluationReport(report);
 

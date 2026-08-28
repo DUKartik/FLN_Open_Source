@@ -294,17 +294,6 @@ export const SuperadminDashboard: React.FC<DashboardProps> = ({ user, token }) =
           </button>
         </div>
 
-        {/* DB Reset for easy demo */}
-        <button
-          onClick={async () => {
-            if (!window.confirm('Reset all database data to fresh seed state? This is irreversible.')) return;
-            await apiFetch('/api/reset', { method: 'POST' });
-            window.location.reload();
-          }}
-          className="px-3 py-1.5 text-xs font-mono font-bold rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950 text-red-600 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900 transition-colors"
-        >
-          🔄 Reset Database
-        </button>
       </div>
 
       {activeTab === 'overview' && (

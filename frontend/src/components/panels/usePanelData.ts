@@ -16,16 +16,6 @@ import { DISTRICT_NAMES, BLOCK_NAMES } from '../../constants';
 // screens that don't display any student data.
 const STUDENTS_NOT_NEEDED_PANELS = new Set(['users', 'worksheet_templates', 'content', 'system_settings']);
 
-const STUDENTS_FALLBACK: Student[] = [
-  { id: 's1', name: 'Amanpreet Singh', age: 8, classGroup: 'Class 2', section: 'A', schoolId: 'gps-mt-001', currentLevel: 12, currentSubLevel: 0, targetLevel: 13, aadharMasked: 'XXXX-XXXX-1234', levelHistory: [{ level: 12, subLevel: 0, date: '2026-03-15', reason: 'Diagnostic' }], streak: 3 },
-  { id: 's2', name: 'Jasmine Kaur', age: 7, classGroup: 'Class 2', section: 'A', schoolId: 'gps-mt-001', currentLevel: 8, currentSubLevel: 1, targetLevel: 12, aadharMasked: 'XXXX-XXXX-5678', levelHistory: [{ level: 8, subLevel: 1, date: '2026-02-20', reason: 'Mid-year' }], streak: 1 },
-  { id: 's3', name: 'Rohit Kumar', age: 9, classGroup: 'Class 3', section: 'A', schoolId: 'gps-mt-001', currentLevel: 36, currentSubLevel: 0, targetLevel: 37, aadharMasked: 'XXXX-XXXX-9012', levelHistory: [{ level: 36, date: '2026-01-10', reason: 'Baseline' }], streak: 5 },
-  { id: 's4', name: 'Priya Sharma', age: 8, classGroup: 'Class 2', section: 'A', schoolId: 'gps-mt-001', currentLevel: 10, currentSubLevel: 2, targetLevel: 14, aadharMasked: 'XXXX-XXXX-3456', levelHistory: [], streak: 0 },
-  { id: 's5', name: 'Arjun Verma', age: 7, classGroup: 'Class 2', section: 'A', schoolId: 'gps-mt-001', currentLevel: 6, currentSubLevel: 0, targetLevel: 11, aadharMasked: 'XXXX-XXXX-7890', levelHistory: [{ level: 6, date: '2026-04-01', reason: 'Diagnostic' }], streak: 2 },
-  { id: 's6', name: 'Neha Gupta', age: 8, classGroup: 'Class 3', section: 'A', schoolId: 'gps-mt-001', currentLevel: 38, currentSubLevel: 1, targetLevel: 40, aadharMasked: 'XXXX-XXXX-2345', levelHistory: [{ level: 38, date: '2026-03-01', reason: 'Mid-year' }], streak: 4 },
-  { id: 's7', name: 'Simran Kaur', age: 6, classGroup: 'Class 1', section: 'A', schoolId: 'gps-mt-001', currentLevel: 4, currentSubLevel: 0, targetLevel: 8, aadharMasked: 'XXXX-XXXX-6789', levelHistory: [], streak: 0 },
-];
-
 const TEACHERS_MOCK = [
   { id: 't1', name: 'Ritu Sharma', email: 'gps-mt-001.t01@fln.org', schoolId: 'gps-mt-001', classes: ['Class 2-A', 'Class 3-A'], studentsCount: 42, delayedAttempts: 0, status: 'Active' },
   { id: 't2', name: 'Amit Kumar', email: 'gps-mt-001.t02@fln.org', schoolId: 'gps-mt-001', classes: ['Class 1-A'], studentsCount: 28, delayedAttempts: 1, status: 'Active' },
@@ -64,6 +54,13 @@ const USERS_FALLBACK = [
 
 export function usePanelData(token: string, currentUser: User, activePanel: string) {
   const [apiStudents, setApiStudents] = useState<Student[]>([]);
+  // Distinct from apiStudents.length === 0 — issue #292: that condition is
+  // true both "fetch hasn't resolved yet" and "fetch succeeded, roster is
+  // genuinely empty" (a brand-new teacher account), and code that can't
+  // tell those apart was previously substituting hardcoded demo students
+  // for the second case too. studentsLoading lets consumers show a real
+  // empty state instead.
+  const [studentsLoading, setStudentsLoading] = useState(true);
   const [apiSchools, setApiSchools] = useState<School[]>([]);
   const [apiUsers, setApiUsers] = useState<any[]>([]);
   const [apiReports, setApiReports] = useState<EvaluationReport[]>([]);
@@ -87,12 +84,17 @@ export function usePanelData(token: string, currentUser: User, activePanel: stri
   // (verified by grepping for the identifier in each branch below).
   useEffect(() => {
     if (apiStudents.length > 0) return;
-    if (STUDENTS_NOT_NEEDED_PANELS.has(activePanel)) return;
+    if (STUDENTS_NOT_NEEDED_PANELS.has(activePanel)) { setStudentsLoading(false); return; }
+    setStudentsLoading(true);
     const headers = { 'Authorization': `Bearer ${token}` };
-    apiFetch('/api/students', { headers }).then(r => r.json()).then(d => { if (Array.isArray(d)) setApiStudents(d); }).catch(() => { });
+    apiFetch('/api/students', { headers })
+      .then(r => r.json())
+      .then(d => { if (Array.isArray(d)) setApiStudents(d); })
+      .catch(() => { })
+      .finally(() => setStudentsLoading(false));
   }, [token, activePanel, apiStudents.length]);
 
-  const students = apiStudents.length > 0 ? apiStudents : STUDENTS_FALLBACK;
+  const students = apiStudents;
   const schools = apiSchools.length > 0 ? apiSchools : SCHOOLS_FALLBACK;
   const usersList = apiUsers.length > 0 ? apiUsers : USERS_FALLBACK;
   // No mock fallback here (unlike students/schools/users): a fake report's
@@ -154,7 +156,7 @@ export function usePanelData(token: string, currentUser: User, activePanel: stri
   };
 
   return {
-    students, schools, usersList, reportsList, worksheetsList, teachersList,
+    students, studentsLoading, schools, usersList, reportsList, worksheetsList, teachersList,
     getDistrictStats, getBlockStats, updateStudentLocally, refreshStudents,
   };
 }

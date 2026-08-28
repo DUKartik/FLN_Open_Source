@@ -230,10 +230,21 @@ export interface EvaluationReport {
   // Issue #180: per-question breakdown, present on reports created after
   // that feature landed. Optional — older reports predate it.
   questionResults?: { questionId: string; question?: string; correctAnswer?: string; submittedAnswer: string; isCorrect: boolean }[];
-  teacherReviewed?: boolean;
-  reviewedBy?: string;
-  reviewedAt?: string;
-}
+    teacherReviewed?: boolean;
+    reviewedBy?: string;
+    reviewedAt?: string;
+    // Per-level pass/fail breakdown — populated by the diagnostic submit handler
+    // (backend/src/routes/students.ts). Diagnostic does NOT assign a placement
+    // level; the UI uses these to show which levels were demonstrated vs which
+    // need remediation.
+    passedLevels?: number[];
+    failedLevels?: number[];
+    // Skills the student is struggling with — conceptIds of the failed levels
+    // plus any direct prerequisites, sourced from the cross-skill graph
+    // (backend/src/competencyPrerequisites.ts). Drives the status text in the
+    // diagnostic panel instead of the old hardcoded "Verified & Certified".
+    skillGaps?: { conceptId: string; level: number; levelTitle: string; strand: string }[];
+  }
 
 export interface Ticket {
   id: string;

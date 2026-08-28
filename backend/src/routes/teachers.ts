@@ -41,6 +41,21 @@ export function registerTeacherRoutes(app: express.Express) {
       };
     });
 
+    // Opt-in pagination (same pattern as GET /api/students, PR #115).
+    // Omitting ?page & ?limit returns the full scoped list — no existing caller breaks.
+    const pageParam = req.query.page as string | undefined;
+    const limitParam = req.query.limit as string | undefined;
+    if (pageParam || limitParam) {
+      const page  = Math.max(1, parseInt(pageParam || '1', 10) || 1);
+      const limit = Math.max(1, Math.min(500, parseInt(limitParam || '50', 10) || 50));
+      const total = enriched.length;
+      const start = (page - 1) * limit;
+      res.set('X-Total-Count', String(total));
+      res.set('X-Page',        String(page));
+      res.set('X-Pages',       String(Math.max(1, Math.ceil(total / limit))));
+      return res.json(enriched.slice(start, start + limit));
+    }
+
     res.json(enriched);
   });
 
