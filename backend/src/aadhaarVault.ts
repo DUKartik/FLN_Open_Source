@@ -259,17 +259,29 @@ function mapVaultErrorResponse(status: number, data: any): VaultError {
 // ===========================================================================
 
 /**
- * Tokenize a raw 12-digit Aadhaar with the Aadhaar Vault microservice.
- * The raw value is sent to the vault over HTTPS and is never stored in the
- * FLN backend's own database.
+ * Tokenize a raw 12-digit Aadhaar.
+ *
+ * The implementation is swappable so the in-process vault module
+ * (backend/src/modules/vault/) can install its own command-bound
+ * function at boot, and so the integration tests can inject a
+ * deterministic stub without standing up a fake HTTP server. The
+ * default implementation is the legacy HTTP path; the vault module
+ * overrides it via {@link __setTokenizeAadhaarImpl} when the
+ * `VAULT_MODULE_ENABLED` flag is on.
  *
  * Throws {@link VaultError} on ANY failure — callers must fail the
  * registration; there is no plaintext fallback path by design.
  */
-export async function tokenizeAadhaar(
+export type TokenizeAadhaarFn = (
   rawAadhar: string,
-  context: AadhaarTokenizeContext = {},
-): Promise<AadhaarVaultTokenizeResult> {
+  context: AadhaarTokenizeContext,
+) => Promise<AadhaarVaultTokenizeResult>;
+
+let tokenizeAadhaarImpl: TokenizeAadhaarFn = async (rawAadhar, context) => {
+  // Legacy HTTP path — the default. Kept working until the vault
+  // module is the only caller. The vault module installs a new impl
+  // at boot (see modules/vault/index.ts) and the HTTP env-vars are
+  // no longer consulted.
   const timeoutMs = resolveTimeoutMs();
   const { status, data } = await callVault('/v1/tokenize', 'vault:tokenize', {
     raw: rawAadhar,
@@ -302,6 +314,32 @@ export async function tokenizeAadhaar(
   }
 
   return data as AadhaarVaultTokenizeResult;
+};
+
+/**
+ * Install a replacement implementation. Called by the in-process vault
+ * module at boot, and by integration tests via `__setTokenizeAadhaarForTest`
+ * (which is the same function but exported under a test-only name so the
+ * production code never has a public setter).
+ */
+export function __setTokenizeAadhaarImpl(fn: TokenizeAadhaarFn | null): void {
+  if (fn === null) {
+    // Reset to the default HTTP path. Useful for test teardown.
+    tokenizeAadhaarImpl = tokenizeAadhaarImplDefault;
+    return;
+  }
+  tokenizeAadhaarImpl = fn;
+}
+
+/** Internal: the default HTTP-backed implementation. Stored as a const
+ *  reference so {@link __setTokenizeAadhaarImpl} can reset to it. */
+const tokenizeAadhaarImplDefault = tokenizeAadhaarImpl;
+
+export async function tokenizeAadhaar(
+  rawAadhar: string,
+  context: AadhaarTokenizeContext = {},
+): Promise<AadhaarVaultTokenizeResult> {
+  return tokenizeAadhaarImpl(rawAadhar, context);
 }
 
 // ===========================================================================

@@ -137,7 +137,7 @@ registerStatsRoutes(app);
   // lightweight (no vault code is parsed unless the flag is on).
   if (process.env.VAULT_MODULE_ENABLED === 'true') {
     const { registerVaultRoutes } = await import('./modules/vault');
-    registerVaultRoutes(app);
+    await registerVaultRoutes(app);
   }
 
   registerEvaluationRoutes(app);
