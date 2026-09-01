@@ -30,6 +30,8 @@ import express from 'express';
 import { dbStore } from '../../db';
 import { buildVaultContext, type VaultContext } from './context';
 import { registerTokenizeRoute } from './routes/tokenize.routes';
+import { registerDetokenizeRoute } from './routes/detokenize.routes';
+import { registerAuditRoute } from './routes/audit.routes';
 import { requireScope } from './middleware';
 
 // Augment Express's `Application` so the wired vault context can be
@@ -100,6 +102,8 @@ export async function registerVaultRoutes(
   // paths match the legacy contract (`/v1/tokenize`, etc.).
   const router = express.Router();
   registerTokenizeRoute(router, app.vaultContext ?? null);
+  registerDetokenizeRoute(router, app.vaultContext ?? null);
+  registerAuditRoute(router, app.vaultContext ?? null);
   app.use(router);
 
   // Console readiness — Phase 5 mounts the static assets here. The

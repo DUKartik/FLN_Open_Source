@@ -98,3 +98,77 @@ export interface AuditRepository {
     opts?: { limit?: number },
   ): Promise<AuditRecord[]>;
 }
+
+// ---------------------------------------------------------------------------
+// Step-up challenge repository (Phase 3)
+// ---------------------------------------------------------------------------
+// Lifecycle: pending → approved → consumed, or pending → expired/failed.
+// The four state transitions are all implemented as `findOneAndUpdate` with
+// a status guard so two concurrent consume() calls collapse to one winner.
+
+export type StepUpChallengeStatus =
+  | 'pending'
+  | 'approved'
+  | 'consumed'
+  | 'expired'
+  | 'failed';
+
+export type StepUpOperation = 'detokenize';
+
+export interface StepUpChallenge {
+  challengeId: string;
+  operation: StepUpOperation;
+  identityId: string;
+  tokenId: string | null;
+  requestedBy: string;
+  requestedAt: Date;
+  expiresAt: Date;
+  approvedAt: Date | null;
+  consumedAt: Date | null;
+  status: StepUpChallengeStatus;
+  requiredFactorId: string;
+  verifiedFactorId: string | null;
+  auditId: string | null;
+  metadata: string | null;
+}
+
+export interface CreateStepUpChallengeInput {
+  challengeId: string;
+  operation: StepUpOperation;
+  identityId: string;
+  tokenId: string | null;
+  requestedBy: string;
+  requestedAt: Date;
+  expiresAt: Date;
+  requiredFactorId: string;
+  metadata: string | null;
+}
+
+export interface ApproveStepUpChallengeInput {
+  challengeId: string;
+  verifiedFactorId: string;
+  approvedAt: Date;
+  auditId: string | null;
+}
+
+export interface StepUpChallengeRepository {
+  /** Persist a new challenge in `pending` state. */
+  create(input: CreateStepUpChallengeInput): Promise<StepUpChallenge>;
+  /** Look up a challenge by id. Returns `null` for unknown ids. */
+  findById(challengeId: string): Promise<StepUpChallenge | null>;
+  /**
+   * Transition `pending → approved`. Returns the updated row, or
+   * `null` if the row was missing or already past `pending`.
+   */
+  approve(input: ApproveStepUpChallengeInput): Promise<StepUpChallenge | null>;
+  /**
+   * Atomic `approved → consumed` transition. Returns the row, or
+   * `null` if the row was missing, not `approved`, or already
+   * `consumed`. This is the single replay-prevention gate.
+   */
+  consume(challengeId: string, consumedAt: Date): Promise<StepUpChallenge | null>;
+  /** Transition `pending → expired`. Returns `null` if missing or not pending. */
+  expire(challengeId: string, expiredAt: Date): Promise<StepUpChallenge | null>;
+  /** Transition `pending → failed`. Returns `null` if missing or not pending. */
+  fail(challengeId: string, failedAt: Date): Promise<StepUpChallenge | null>;
+}

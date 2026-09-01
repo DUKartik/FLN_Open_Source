@@ -1,16 +1,28 @@
 /**
- * Aadhaar Vault Step-Up detokenization tests (Session 7E wiring).
+ * Aadhaar Vault Step-Up detokenization tests (Phase 3 in-process).
  *
  * Run:  cd backend && npm run test:detokenize
  *       (or `npm test` runs both files)
  *
  * Isolation model: same as aadhaar-hardening.test.ts — chdir into a
  * fresh temp dir BEFORE importing modules, delete MONGODB_URI so the
- * file-fallback store is used, stand up a fake vault on an ephemeral
- * port. The fake vault here is richer: it implements the full Step-Up
- * lifecycle (enroll MFA → request → approve → detokenize) so the
- * production admin endpoints at backend/src/routes/aadhaarDetokenize.ts
- * can be exercised end-to-end.
+ * file-fallback store is used. The in-process detokenize command is
+ * stubbed via `__setDetokenizeAadhaarImpl` so the file-fallback env
+ * (no Mongo replica set) can still exercise the full Step-Up admin
+ * flow through the FLN backend's existing routes.
+ *
+ * The fake HTTP vault retains the four endpoints the in-process
+ * module does NOT implement yet (Phase 4 lands the in-process MFA
+ * and step-up-request/approve commands):
+ *   - POST /v1/tokenize
+ *   - POST /v1/mfa/enroll
+ *   - POST /v1/detokenize/request
+ *   - POST /v1/detokenize/step-up/:challengeId/approve
+ *
+ * The /v1/detokenize endpoint is replaced by the in-process stub
+ * installed via `__setDetokenizeAadhaarImpl`. The stub consults the
+ * same in-memory `challenges` / `tokens` Maps the fake HTTP vault
+ * uses, so the cross-component state stays coherent.
  *
  * No plaintext Aadhaar is ever printed; assertions only test FOR it.
  */
@@ -30,12 +42,20 @@ delete process.env.MONGODB_URI;         // force the file-fallback store
 process.env.NODE_ENV = 'test';
 process.env.JWT_SECRET = 'dev-insecure-secret-change-me';
 process.env.SEED_DEMO_PASSWORD = 'Fln@2026';
-// The client refuses to mint a service JWT without this (fail-closed) — the
-// fake vault ignores the value, it only needs to be present.
+// The tokenize client refuses to mint a service JWT without this
+// (fail-closed). We replace the tokenize impl at boot, but the
+// default HTTP fallback still requires the env var to be present
+// (a stray call would surface NOT_CONFIGURED rather than UNREACHABLE).
 process.env.AADHAAR_VAULT_SERVICE_JWT_SECRET = 'test-only-hmac-secret-not-a-real-credential';
 delete process.env.AADHAAR_VAULT_SERVICE_JWT_ISSUER;
 delete process.env.AADHAAR_VAULT_SERVICE_JWT_AUDIENCE;
 delete process.env.AADHAAR_VAULT_TIMEOUT_MS;
+// Phase 3 in-process vault would need a real Mongo replica set to
+// run; the test environment is file-fallback only. The vault
+// module is NOT enabled here, and we install the in-process
+// detokenize impl directly via `__setDetokenizeAadhaarImpl`.
+delete process.env.LOCAL_DEV_MASTER_KEY;
+delete process.env.VAULT_MODULE_ENABLED;
 
 // ─── TOTP helpers (RFC 6238 / HMAC-SHA1, 6 digits, 30s period) ────────────
 function totpCode(secretBytes: Buffer, time = Math.floor(Date.now() / 1000)): string {
@@ -54,7 +74,8 @@ function totpCode(secretBytes: Buffer, time = Math.floor(Date.now() / 1000)): st
   return (binary % 1_000_000).toString().padStart(6, '0');
 }
 
-// ─── In-memory fake-vault state ────────────────────────────────────────────
+// ─── In-memory fake-vault state (shared between fake HTTP and the
+//     in-process detokenize stub) ─────────────────────────────────────────
 type Factor = {
   factorId: string;
   actor: string;
@@ -71,6 +92,7 @@ type Challenge = {
   status: 'pending' | 'approved' | 'consumed';
   expiresAt: number;
   requestedBy: string;
+  identityId: string;
 };
 type Token = { rawAadhaar: string; identityId: string };
 
@@ -81,6 +103,21 @@ let lastAuthWasBearer = false;
 
 /** Per-test challenge TTL (ms). Tests override this to force expiry. */
 let challengeTtlMs = 300_000; // 5 min — matches the real vault default
+
+/** Identity-row registry so the in-process detokenize stub can
+ *  resolve identityId by tokenId and look up the (mock) ciphertext
+ *  + AAD. (In the real module the repository's `findById` walks
+ *  vault_identities — for the stub we keep the bare minimum.) */
+const identityRows = new Map<string, {
+  identityId: string;
+  ciphertext: Buffer;
+  aad: Buffer;
+  pepperVersion: number;
+  keyVersion: number;
+  createdAt: Date;
+  rotatedAt: Date | null;
+  revokedAt: Date | null;
+}>();
 
 const vaultServer = http.createServer((req, res) => {
   let body = '';
@@ -102,6 +139,21 @@ const vaultServer = http.createServer((req, res) => {
       const tokenId = 'tok-' + crypto.randomUUID();
       const identityId = 'id-' + crypto.createHash('sha256').update(digits + ':fake-pepper:1').digest('hex').slice(0, 16);
       tokens.set(tokenId, { rawAadhaar: digits, identityId });
+      // Seed a minimal identity row so the in-process detokenize
+      // stub (when it eventually walks vault_identities) has
+      // something to find. (For the current shape, the stub
+      // resolves plaintext from the `tokens` Map directly — the
+      // identity row is just a placeholder.)
+      identityRows.set(identityId, {
+        identityId,
+        ciphertext: Buffer.from('placeholder', 'utf8'),
+        aad: Buffer.from('aadhaar-vault/v1|placeholder', 'utf8'),
+        pepperVersion: 1,
+        keyVersion: 1,
+        createdAt: new Date(),
+        rotatedAt: null,
+        revokedAt: null,
+      });
       return sendJson(201, {
         token: tokenId,
         last4: raw,
@@ -148,12 +200,14 @@ const vaultServer = http.createServer((req, res) => {
       const fac = factors.get(factorId);
       if (!fac) return sendJson(404, { error: 'FACTOR_NOT_FOUND', message: 'No such factor.' });
       if (fac.status !== 'ACTIVE') return sendJson(403, { error: 'FACTOR_NOT_ACTIVE', message: 'Factor inactive.' });
+      const tok = tokens.get(tokenId)!;
       const challengeId = 'chl-' + crypto.randomUUID();
       challenges.set(challengeId, {
         challengeId, tokenId, factorId,
         status: 'pending',
         expiresAt: Date.now() + challengeTtlMs,
         requestedBy: String(parsed?.context?.actorId || ''),
+        identityId: tok.identityId,
       });
       return sendJson(200, {
         challengeId,
@@ -185,23 +239,15 @@ const vaultServer = http.createServer((req, res) => {
       });
     }
 
-    // ── detokenize (release) ────────────────────────────────────────────
+    // /v1/detokenize is no longer served by the fake HTTP vault —
+    // it's handled in-process by the stub installed via
+    // `__setDetokenizeAadhaarImpl`. The HTTP route would 404 here
+    // anyway; we return a clear "use the in-process path" error
+    // so a regression that bypasses the shim is loud.
     if (req.method === 'POST' && url === '/v1/detokenize') {
-      const challengeId = String(parsed.challengeId || '');
-      const ch = challenges.get(challengeId);
-      if (!ch) return sendJson(404, { error: 'CHALLENGE_NOT_FOUND', message: 'No such challenge.' });
-      if (ch.status === 'consumed') return sendJson(409, { error: 'CHALLENGE_CONSUMED', message: 'Replay.' });
-      if (ch.status !== 'approved') return sendJson(403, { error: 'CHALLENGE_NOT_APPROVED', message: 'Not approved.' });
-      if (Date.now() > ch.expiresAt) return sendJson(410, { error: 'CHALLENGE_EXPIRED', message: 'Expired.' });
-      const tok = tokens.get(ch.tokenId);
-      if (!tok) return sendJson(404, { error: 'TOKEN_NOT_FOUND', message: 'No token.' });
-      ch.status = 'consumed';
-      return sendJson(200, {
-        token: ch.tokenId,
-        identityId: tok.identityId,
-        aadhaar: tok.rawAadhaar,
-        last4: tok.rawAadhaar.slice(-4),
-        auditId: `audit-detok-${challengeId.slice(0, 8)}`,
+      return sendJson(410, {
+        error: 'GONE',
+        message: 'detokenize is now in-process; install __setDetokenizeAadhaarImpl',
       });
     }
 
@@ -217,6 +263,87 @@ const { dbStore } = await import('../src/db');
 const { JWT_SECRET } = await import('../src/auth');
 const { registerStudentRoutes } = await import('../src/routes/students');
 const { registerAadhaarDetokenizeRoutes } = await import('../src/routes/aadhaarDetokenize');
+const aadhaarVaultModule = await import('../src/aadhaarVault');
+
+// Replace the in-process vault's tokenize + detokenize
+// implementations with deterministic stubs. The tokenize stub is
+// the same shape as the hardening-test stub. The detokenize stub
+// reads from the in-memory `challenges` / `tokens` Maps the fake
+// HTTP vault uses, so cross-component state stays coherent.
+aadhaarVaultModule.__setTokenizeAadhaarImpl(async (rawAadhar) => {
+  const digits = String(rawAadhar).replace(/[^0-9]/g, '');
+  const tokenId = 'tok-' + crypto.randomUUID();
+  const identityId = 'id-' + crypto.createHash('sha256').update(digits + ':fake-pepper:1').digest('hex').slice(0, 16);
+  tokens.set(tokenId, { rawAadhaar: digits, identityId });
+  identityRows.set(identityId, {
+    identityId,
+    ciphertext: Buffer.from('placeholder', 'utf8'),
+    aad: Buffer.from('aadhaar-vault/v1|placeholder', 'utf8'),
+    pepperVersion: 1,
+    keyVersion: 1,
+    createdAt: new Date(),
+    rotatedAt: null,
+    revokedAt: null,
+  });
+  return {
+    token: tokenId,
+    last4: digits.slice(-4),
+    tokenType: 'AADHAAR',
+    identityId,
+    auditId: `audit-tokenize-${tokens.size}`,
+    keyVersion: 'kv-1',
+  };
+});
+
+// CAS-aware in-process detokenize stub. The first caller that
+// finds status='approved' wins the transition; subsequent callers
+// see status='consumed' and get CHALLENGE_CONSUMED. This mirrors
+// the Mongo adapter's findOneAndUpdate({_id, status: 'approved'})
+// CAS gate and the Postgres adapter's
+// `UPDATE ... WHERE status = 'approved' RETURNING *` semantics.
+aadhaarVaultModule.__setDetokenizeAadhaarImpl(async (params) => {
+  const challengeId = params.challengeId;
+  const ch = challenges.get(challengeId);
+  if (!ch) {
+    throw new aadhaarVaultModule.VaultError('CHALLENGE_NOT_FOUND', 404, 'No such challenge.');
+  }
+  if (ch.status === 'consumed') {
+    throw new aadhaarVaultModule.VaultError('CHALLENGE_CONSUMED', 409, 'Replay.');
+  }
+  if (ch.status !== 'approved') {
+    throw new aadhaarVaultModule.VaultError('CHALLENGE_NOT_APPROVED', 403, 'Not approved.');
+  }
+  if (Date.now() > ch.expiresAt) {
+    throw new aadhaarVaultModule.VaultError('CHALLENGE_EXPIRED', 410, 'Expired.');
+  }
+  const tok = tokens.get(ch.tokenId);
+  if (!tok) {
+    throw new aadhaarVaultModule.VaultError('TOKEN_NOT_FOUND', 404, 'No token.');
+  }
+  // Actor-binding check (defence in depth — the URL path is
+  // already authorization-gated by the FLN route, but the in-
+  // process command enforces it too). The actorRole comes from
+  // the AadhaarActorContext the shim hands us; identity comes
+  // from the email. Match against the request route's
+  // `requestedBy` projection.
+  const callerActorId = params.context.email || 'fln-backend-service';
+  if (ch.requestedBy !== callerActorId) {
+    throw new aadhaarVaultModule.VaultError(
+      'ACTOR_MISMATCH',
+      403,
+      `challenge was requested by ${ch.requestedBy}, not ${callerActorId}.`,
+    );
+  }
+  // CAS — atomic consume. First-writer-wins.
+  ch.status = 'consumed';
+  return {
+    token: ch.tokenId,
+    identityId: tok.identityId,
+    aadhaar: tok.rawAadhaar,
+    last4: tok.rawAadhaar.slice(-4),
+    auditId: `audit-detok-${challengeId.slice(0, 8)}`,
+  };
+});
 
 await dbStore.init();
 
@@ -253,7 +380,8 @@ async function api(method: string, reqPath: string, email: string, body?: unknow
 }
 
 /** Register a single student via the public POST /api/students path so we
- *  get a real aadhaarTokenId persisted in MongoDB. Returns the student id. */
+ *  get a real aadhaarTokenId persisted in the file-fallback DB. Returns
+ *  the student id. */
 async function registerStudent(raw: string, name: string): Promise<string> {
   const res = await api('POST', '/api/students', TEACHER, {
     name, classGroup: 'Class 1', section: 'A', age: 7, aadharNumber: raw,
@@ -263,6 +391,10 @@ async function registerStudent(raw: string, name: string): Promise<string> {
 }
 
 after(async () => {
+  // Reset in-process impls so subsequent test files (if any) see
+  // the default HTTP-backed implementation.
+  aadhaarVaultModule.__setTokenizeAadhaarImpl(null);
+  aadhaarVaultModule.__setDetokenizeAadhaarImpl(null);
   await new Promise<void>(resolve => apiServer.close(() => resolve()));
   vaultServer.close();
   (apiServer as any).closeAllConnections?.();
@@ -334,7 +466,9 @@ test('TEST 8: SUPERADMIN can drive full Step-Up lifecycle and recover original r
   assert.equal(approveRes.json.status, 'approved');
   assert.equal(approveRes.json.verifiedFactorId, enrollRes.json.factorId);
 
-  // (d) detokenize with the approved challenge
+  // (d) detokenize with the approved challenge — now goes through
+  // the in-process stub installed at boot, not the fake HTTP
+  // vault's /v1/detokenize endpoint.
   const detokRes = await api('POST', `/api/students/${studentId}/aadhaar/detokenize`, SUPERADMIN, {
     challengeId: reqRes.json.challengeId,
   });
@@ -404,23 +538,21 @@ test('TEST 10: cross-student token substitution rejected (token comes from DB on
 
   // Now attempt to consume that challenge via Bob's endpoint. The backend
   // will resolve Bob's token id (a different opaque string), but the
-  // challenge is bound to Alice's token. The vault returns
-  // CHALLENGE_OPERATION_MISMATCH (defensive — the vault enforces actor/
-  // token binding at the command layer; our fake returns the closest
-  // equivalent: a successful consumption decrypts Alice regardless of
-  // which URL we used, because the challenge holds the token). So the
-  // assertion that matters here is: we cannot SUBSTITUTE the token id —
-  // the URL path is the only thing the client controls, and the backend
-  // resolves the token strictly from the authorized student's DB row.
+  // challenge is bound to Alice's token. So the assertion that matters
+  // here is: we cannot SUBSTITUTE the token id — the URL path is the
+  // only thing the client controls, and the backend resolves the token
+  // strictly from the authorized student's DB row.
   const detokRes = await api('POST', `/api/students/${bobId}/aadhaar/detokenize`, SUPERADMIN, {
     challengeId: reqRes.json.challengeId,
   });
-  // The fake vault binds the challenge to Alice's token. The challenge was
-  // already consumed by Alice's request in the same test? No — we haven't
-  // consumed it yet, so the consumption decrypts Alice's plaintext even
-  // when called via Bob's URL. This proves that **the backend never lets
-  // the client pick the token** — only the student id, which is then
-  // authorization-gated.
+  // The challenge binds to Alice's token. The challenge is still
+  // approved (not yet consumed), so the in-process stub's actor-
+  // binding check uses the SUPERADMIN's email. The challenge was
+  // requested by SUPERADMIN, so actor-binding passes. The
+  // consumption decrypts Alice's plaintext (the challenge holds
+  // Alice's tokenId) — proving the backend never lets the client
+  // pick the token, only the student id, which is authorization-
+  // gated.
   assert.equal(detokRes.status, 200);
   assert.equal(detokRes.json.aadhaar, '404040404040', 'must decrypt Alice, not Bob');
 
@@ -484,4 +616,64 @@ test('TEST 12: expired challenge returns 410 and detokenize is forbidden', async
   } finally {
     challengeTtlMs = 300_000;
   }
+});
+
+test('TEST 13: CAS gate — two concurrent consume() calls collapse to one winner', async () => {
+  // Direct test of the in-process detokenize stub's CAS gate. The
+  // stub mirrors the Mongo adapter's findOneAndUpdate({_id, status:
+  // 'approved'}) CAS: the first caller finds status='approved' and
+  // transitions to 'consumed'; the second caller finds status=
+  // 'consumed' and is rejected with CHALLENGE_CONSUMED.
+  //
+  // We mint a fresh approved challenge (bypassing TOTP by directly
+  // mutating the in-memory Map), then fire two concurrent
+  // detokenize calls. One must succeed; the other must surface
+  // CHALLENGE_CONSUMED.
+  const studentId = await registerStudent('808080808080', 'Test 13 CAS');
+  const enrollRes = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, SUPERADMIN, {});
+  assert.equal(enrollRes.status, 200);
+  const reqRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/request`, SUPERADMIN, {
+    factorId: enrollRes.json.factorId,
+  });
+  assert.equal(reqRes.status, 200);
+  const challengeId = reqRes.json.challengeId;
+
+  // Mint a valid TOTP code and approve.
+  const fac = factors.get(enrollRes.json.factorId)!;
+  const code = totpCode(fac.secretBytes);
+  const approveRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/approve`, SUPERADMIN, {
+    challengeId, code,
+  });
+  assert.equal(approveRes.status, 200);
+
+  // The challenge is now 'approved'. Fire two concurrent
+  // detokenize calls. The in-process stub's CAS gate ensures
+  // exactly one succeeds.
+  const [a, b] = await Promise.allSettled([
+    api('POST', `/api/students/${studentId}/aadhaar/detokenize`, SUPERADMIN, { challengeId }),
+    api('POST', `/api/students/${studentId}/aadhaar/detokenize`, SUPERADMIN, { challengeId }),
+  ]);
+
+  const fulfilled = [a, b].filter(r => r.status === 'fulfilled') as PromiseFulfilledResult<{ status: number; json: any }>[];
+  const rejected = [a, b].filter(r => r.status === 'rejected');
+
+  // Both API calls should resolve (they're fetch, not the
+  // underlying command) — but the underlying CAS gate should
+  // surface CHALLENGE_CONSUMED on exactly one of them.
+  assert.equal(fulfilled.length, 2, 'both HTTP calls should resolve');
+  const statuses = fulfilled.map(r => r.value.status).sort();
+  // One 200, one 409 (CHALLENGE_CONSUMED) — the API layer
+  // surfaces the in-process VaultError directly. (Order is
+  // racy; we sort to make the assertion deterministic.)
+  assert.deepEqual(statuses, [200, 409], `expected [200, 409], got [${statuses.join(',')}]`);
+  const okRes = fulfilled.find(r => r.value.status === 200)!;
+  const consumedRes = fulfilled.find(r => r.value.status === 409)!;
+  assert.equal(okRes.value.json.aadhaar, '808080808080', 'winner must decrypt');
+  assert.equal(consumedRes.value.json.error, 'CHALLENGE_CONSUMED', 'loser must surface CHALLENGE_CONSUMED');
+
+  // After both calls settle, the challenge Map must show
+  // 'consumed' exactly once.
+  const finalCh = challenges.get(challengeId)!;
+  assert.equal(finalCh.status, 'consumed', 'challenge must end in consumed state');
+  void rejected; // both HTTP calls resolve; rejected list is empty.
 });

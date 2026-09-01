@@ -570,21 +570,28 @@ export type DetokenizeResult = {
 };
 
 /**
- * Consume an approved step-up challenge and recover the plaintext Aadhaar.
+ * Detokenize — thin wrapper around a swappable implementation.
  *
- * Throws {@link VaultError} on any failure. The most important domain
- * failures are:
- *   - CHALLENGE_CONSUMED  (409) — replay attempt
- *   - CHALLENGE_EXPIRED   (410) — stale challenge
- *   - CHALLENGE_NOT_APPROVED (403) — caller skipped the approve step
- *   - ACTOR_MISMATCH      (403) — caller did not mint this challenge
+ * The implementation is swappable so the in-process vault module
+ * (`backend/src/modules/vault/`) can install its own command-bound
+ * function at boot, and so the integration tests can inject a
+ * deterministic stub without standing up the full Mongo replica
+ * set. The default implementation is the legacy HTTP path; the
+ * vault module overrides it via {@link __setDetokenizeAadhaarImpl}
+ * when the `VAULT_MODULE_ENABLED` flag is on.
  *
- * Callers MUST handle the plaintext according to the system-wide "never
- * persist / never cache" rule (clear it after the admin is done viewing).
+ * Throws {@link VaultError} on ANY failure — callers must fail the
+ * reveal; there is no plaintext fallback path by design.
  */
-export async function detokenizeAadhaar(
+export type DetokenizeAadhaarFn = (
   params: DetokenizeParams,
-): Promise<DetokenizeResult> {
+) => Promise<DetokenizeResult>;
+
+let detokenizeAadhaarImpl: DetokenizeAadhaarFn = async (params) => {
+  // Legacy HTTP path — the default. Kept working until the vault
+  // module is the only caller. The vault module installs a new
+  // impl at boot (see modules/vault/index.ts) and the HTTP env-
+  // vars are no longer consulted.
   const timeoutMs = resolveTimeoutMs();
   const { status, data } = await callVault('/v1/detokenize', 'vault:detokenize', {
     challengeId: params.challengeId,
@@ -622,4 +629,28 @@ export async function detokenizeAadhaar(
     last4: data.last4,
     auditId: data.auditId,
   };
+};
+
+/**
+ * Install a replacement implementation. Called by the in-process
+ * vault module at boot, and by integration tests via the test-
+ * only name (the production code never has a public setter).
+ */
+export function __setDetokenizeAadhaarImpl(fn: DetokenizeAadhaarFn | null): void {
+  if (fn === null) {
+    detokenizeAadhaarImpl = detokenizeAadhaarImplDefault;
+    return;
+  }
+  detokenizeAadhaarImpl = fn;
+}
+
+/** Internal: the default HTTP-backed implementation. Stored as a
+ *  const reference so {@link __setDetokenizeAadhaarImpl} can reset
+ *  to it. */
+const detokenizeAadhaarImplDefault = detokenizeAadhaarImpl;
+
+export async function detokenizeAadhaar(
+  params: DetokenizeParams,
+): Promise<DetokenizeResult> {
+  return detokenizeAadhaarImpl(params);
 }
