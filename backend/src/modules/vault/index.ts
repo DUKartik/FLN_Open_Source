@@ -21,8 +21,16 @@
  * The full lifecycle (Phase 3 → Phase 7) progressively adds:
  *   - Phase 3: detokenize (POST /v1/detokenize) + audit (GET /v1/audit)
  *   - Phase 4: step-up request/approve + MFA enroll/verify
- *   - Phase 5: console static mount at /console/
- *   - Phase 6: graceful shutdown hook (no-op here, lives in backend/src/index.ts)
+ *   - Phase 5: console static mount at /console/ (DROPPED 2026-09-01
+ *              per user direction — admin Step-Up flow is implemented
+ *              directly against the main backend, so the standalone
+ *              console UI is not needed)
+ *   - Phase 6: graceful shutdown surface
+ *              (`getActiveVaultTransactionCount`,
+ *              `waitForVaultTransactionsDrain`) re-exported here so
+ *              the boot script in `backend/src/index.ts` can drive
+ *              the shutdown sequence without reaching into
+ *              implementation paths.
  *   - Phase 7: drop the VAULT_MODULE_ENABLED flag entirely
  */
 import type { Express, Request, Response } from 'express';
@@ -36,6 +44,10 @@ import { registerMfaEnrollRoute } from './routes/mfa-enroll.routes';
 import { registerStepUpRequestRoute } from './routes/step-up-request.routes';
 import { registerStepUpApproveRoute } from './routes/step-up-approve.routes';
 import { requireScope } from './middleware';
+import {
+  getActiveCount as getActiveVaultTransactionCount,
+  waitForDrain as waitForVaultTransactionsDrain,
+} from './infrastructure/db/vault-transaction-counter';
 
 // Augment Express's `Application` so the wired vault context can be
 // read off `req.app.vaultContext` without `any`. We deliberately
@@ -122,3 +134,21 @@ export async function registerVaultRoutes(
   // `requireScope` can short-circuit cleanly.
   void requireScope; // keep import live for future phases
 }
+
+// Re-exported so the boot script (`backend/src/index.ts`) can drive
+// the graceful-shutdown sequence without reaching into private
+// implementation paths. The names are stable; the underlying
+// counter is process-local.
+//
+//   - getActiveVaultTransactionCount() — number of in-flight
+//     `session.withTransaction` blocks right now. Mostly used by
+//     tests; the boot script uses it to log how many writes are
+//     still pending at shutdown start.
+//   - waitForVaultTransactionsDrain(timeoutMs) — resolves with
+//     `true` when the count reaches zero, `false` on timeout. The
+//     boot script calls this in the shutdown sequence so a
+//     SIGTERM does not orphan an in-flight multi-document write.
+export {
+  getActiveVaultTransactionCount,
+  waitForVaultTransactionsDrain,
+};

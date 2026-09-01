@@ -28,6 +28,7 @@ import type {
 import { MongoIdentityRepository } from './mongo-identity.repository';
 import { MongoTokenRepository } from './mongo-token.repository';
 import { MongoAuditRepository } from './mongo-audit.repository';
+import { acquire, release } from './vault-transaction-counter';
 
 // Driver error messages that mean "this MongoDB deployment cannot
 // service multi-document transactions". Used to translate a driver-
@@ -51,6 +52,12 @@ export class MongoTransactionalVaultWriter implements TransactionalVaultWriter {
   ) {}
 
   async runWrite<T>(work: (conn: VaultWriteConnection) => Promise<T>): Promise<T> {
+    // Phase 6: register this write with the graceful-shutdown
+    // counter so server.close() can wait for in-flight vault
+    // transactions before closing the Mongo client. The `release`
+    // is in the outer `finally` so it fires on every exit branch
+    // (success, replica-set error, generic throw).
+    acquire();
     const session: ClientSession = this.client.startSession();
     let result: T;
     try {
@@ -80,6 +87,7 @@ export class MongoTransactionalVaultWriter implements TransactionalVaultWriter {
       }
     } finally {
       await session.endSession().catch(() => undefined);
+      release();
     }
     return result!;
   }
