@@ -367,13 +367,27 @@ export type EnrollMfaResult = {
  * Enroll a TOTP MFA factor for a given actor (admin). Returns the
  * `otpauth://` URI for the QR code and the factor envelope.
  *
+ * The implementation is swappable so the in-process vault module
+ * (`backend/src/modules/vault/`) can install its own command-bound
+ * function at boot, and so integration tests can inject a
+ * deterministic stub without standing up the full Mongo replica
+ * set. The default implementation is the legacy HTTP path; the
+ * vault module overrides it via {@link __setEnrollMfaImpl} when the
+ * `VAULT_MODULE_ENABLED` flag is on.
+ *
  * The returned `otpauthUri` embeds the TOTP secret — the frontend MUST
  * treat it as a secret (only render the QR / copy-to-clipboard inside the
  * admin's session, never persist it on the FLN side, never log it).
  *
  * Throws {@link VaultError} on any failure.
  */
-export async function enrollMfa(params: EnrollMfaParams): Promise<EnrollMfaResult> {
+export type EnrollMfaFn = (params: EnrollMfaParams) => Promise<EnrollMfaResult>;
+
+let enrollMfaImpl: EnrollMfaFn = async (params) => {
+  // Legacy HTTP path — the default. Kept working until the vault
+  // module is the only caller. The vault module installs a new impl
+  // at boot (see modules/vault/index.ts) and the HTTP env-vars are
+  // no longer consulted.
   const timeoutMs = resolveTimeoutMs();
   const body: Record<string, unknown> = {
     actor: params.actor,
@@ -414,6 +428,27 @@ export async function enrollMfa(params: EnrollMfaParams): Promise<EnrollMfaResul
     otpauthUri: data.otpauthUri,
     factor: data.factor ?? {},
   };
+};
+
+/**
+ * Install a replacement implementation. Called by the in-process
+ * vault module at boot, and by integration tests via the test-
+ * only name. Pass `null` to reset to the default HTTP path.
+ */
+export function __setEnrollMfaImpl(fn: EnrollMfaFn | null): void {
+  if (fn === null) {
+    enrollMfaImpl = enrollMfaImplDefault;
+    return;
+  }
+  enrollMfaImpl = fn;
+}
+
+/** Internal: the default HTTP-backed implementation. Stored as a
+ *  const reference so {@link __setEnrollMfaImpl} can reset to it. */
+const enrollMfaImplDefault = enrollMfaImpl;
+
+export async function enrollMfa(params: EnrollMfaParams): Promise<EnrollMfaResult> {
+  return enrollMfaImpl(params);
 }
 
 // ===========================================================================
@@ -438,11 +473,23 @@ export type RequestDetokenizationResult = {
  * Mint a step-up challenge bound to a specific token and admin MFA factor.
  * Returns the challenge id the admin must approve with a TOTP code.
  *
+ * The implementation is swappable so the in-process vault module
+ * (`backend/src/modules/vault/`) can install its own command-bound
+ * function at boot, and so integration tests can inject a
+ * deterministic stub. The default implementation is the legacy
+ * HTTP path; the vault module overrides it via
+ * {@link __setRequestDetokenizationImpl} when the
+ * `VAULT_MODULE_ENABLED` flag is on.
+ *
  * Throws {@link VaultError} on any failure.
  */
-export async function requestDetokenization(
+export type RequestDetokenizationFn = (
   params: RequestDetokenizationParams,
-): Promise<RequestDetokenizationResult> {
+) => Promise<RequestDetokenizationResult>;
+
+let requestDetokenizationImpl: RequestDetokenizationFn = async (params) => {
+  // Legacy HTTP path — the default. Kept working until the vault
+  // module is the only caller.
   const timeoutMs = resolveTimeoutMs();
   const { status, data } = await callVault('/v1/detokenize/request', 'vault:detokenize', {
     tokenId: params.tokenId,
@@ -478,6 +525,29 @@ export async function requestDetokenization(
     expiresAt: data.expiresAt instanceof Date ? data.expiresAt.toISOString() : data.expiresAt,
     requiredFactor: data.requiredFactor ?? {},
   };
+};
+
+/**
+ * Install a replacement implementation. Pass `null` to reset to
+ * the default HTTP path.
+ */
+export function __setRequestDetokenizationImpl(fn: RequestDetokenizationFn | null): void {
+  if (fn === null) {
+    requestDetokenizationImpl = requestDetokenizationImplDefault;
+    return;
+  }
+  requestDetokenizationImpl = fn;
+}
+
+/** Internal: the default HTTP-backed implementation. Stored as a
+ *  const reference so {@link __setRequestDetokenizationImpl} can
+ *  reset to it. */
+const requestDetokenizationImplDefault = requestDetokenizationImpl;
+
+export async function requestDetokenization(
+  params: RequestDetokenizationParams,
+): Promise<RequestDetokenizationResult> {
+  return requestDetokenizationImpl(params);
 }
 
 // ===========================================================================
@@ -501,12 +571,23 @@ export type ApproveStepUpResult = {
 /**
  * Approve a step-up challenge by submitting the admin's TOTP code.
  *
+ * The implementation is swappable so the in-process vault module
+ * (`backend/src/modules/vault/`) can install its own command-bound
+ * function at boot. The default implementation is the legacy HTTP
+ * path; the vault module overrides it via
+ * {@link __setApproveStepUpChallengeImpl} when the
+ * `VAULT_MODULE_ENABLED` flag is on.
+ *
  * Throws {@link VaultError} on any failure — including CODE_MISMATCH
  * (mapped to 403) and CHALLENGE_EXPIRED (mapped to 410).
  */
-export async function approveStepUpChallenge(
+export type ApproveStepUpChallengeFn = (
   params: ApproveStepUpParams,
-): Promise<ApproveStepUpResult> {
+) => Promise<ApproveStepUpResult>;
+
+let approveStepUpChallengeImpl: ApproveStepUpChallengeFn = async (params) => {
+  // Legacy HTTP path — the default. Kept working until the vault
+  // module is the only caller.
   const timeoutMs = resolveTimeoutMs();
   const { status, data } = await callVault(
     `/v1/detokenize/step-up/${encodeURIComponent(params.challengeId)}/approve`,
@@ -547,6 +628,29 @@ export async function approveStepUpChallenge(
     approvedAt: data.approvedAt,
     verifiedFactorId: data.verifiedFactorId,
   };
+};
+
+/**
+ * Install a replacement implementation. Pass `null` to reset to
+ * the default HTTP path.
+ */
+export function __setApproveStepUpChallengeImpl(fn: ApproveStepUpChallengeFn | null): void {
+  if (fn === null) {
+    approveStepUpChallengeImpl = approveStepUpChallengeImplDefault;
+    return;
+  }
+  approveStepUpChallengeImpl = fn;
+}
+
+/** Internal: the default HTTP-backed implementation. Stored as a
+ *  const reference so {@link __setApproveStepUpChallengeImpl} can
+ *  reset to it. */
+const approveStepUpChallengeImplDefault = approveStepUpChallengeImpl;
+
+export async function approveStepUpChallenge(
+  params: ApproveStepUpParams,
+): Promise<ApproveStepUpResult> {
+  return approveStepUpChallengeImpl(params);
 }
 
 // ===========================================================================

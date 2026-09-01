@@ -30,19 +30,30 @@ import { MongoIdentityRepository } from './infrastructure/db/mongo-identity.repo
 import { MongoTokenRepository } from './infrastructure/db/mongo-token.repository';
 import { MongoAuditRepository } from './infrastructure/db/mongo-audit.repository';
 import { MongoStepUpChallengeRepository } from './infrastructure/db/mongo-step-up-challenge.repository';
+import { MongoMfaFactorRepository } from './infrastructure/db/mongo-mfa-factor.repository';
 import { ensureVaultIndexes } from './schema/indexes';
 import { makeTokenizeAadhaar } from './application/commands/tokenize-aadhaar';
 import { makeDetokenizeAadhaar } from './application/commands/detokenize-aadhaar';
 import { makeReadAuditHistory } from './application/commands/read-audit-history';
+import { makeEnrollMfa } from './application/commands/enroll-mfa';
+import { makeRequestDetokenization } from './application/commands/request-detokenization';
+import { makeApproveStepUpChallenge } from './application/commands/approve-step-up-challenge';
+import { OtpAuthTotpVerifier } from './infrastructure/mfa/totp-verifier';
 import {
   __setTokenizeAadhaarImpl,
   __setDetokenizeAadhaarImpl,
+  __setEnrollMfaImpl,
+  __setRequestDetokenizationImpl,
+  __setApproveStepUpChallengeImpl,
 } from '../../aadhaarVault';
 
 export interface VaultContext {
   tokenize: ReturnType<typeof makeTokenizeAadhaar>;
   detokenize: ReturnType<typeof makeDetokenizeAadhaar>;
   readAuditHistory: ReturnType<typeof makeReadAuditHistory>;
+  enrollMfa: ReturnType<typeof makeEnrollMfa>;
+  requestDetokenization: ReturnType<typeof makeRequestDetokenization>;
+  approveStepUpChallenge: ReturnType<typeof makeApproveStepUpChallenge>;
   keyManagerInfo: { provider: string; currentVersion: string; algorithm: string };
 }
 
@@ -104,11 +115,18 @@ export async function buildVaultContext(
 
   // Repositories (all read-side; writes go through vaultWriter
   // for the tokenize path). Identity + token + audit + challenge
-  // are the four collections the detokenize path walks.
+  // + mfa are the five collections the detokenize + step-up paths
+  // walk.
   const identities = new MongoIdentityRepository(input.db);
   const tokens = new MongoTokenRepository(input.db);
   const audit = new MongoAuditRepository(input.db);
   const challenges = new MongoStepUpChallengeRepository(input.db);
+  const mfa = new MongoMfaFactorRepository(input.db);
+
+  // RFC 6238 TOTP verifier. The application-layer
+  // `TotpVerifier` port keeps `otpauth` confined to a single
+  // adapter so the commands never import it directly.
+  const totp = new OtpAuthTotpVerifier();
 
   // Commands. The detokenize command needs the read-side repos
   // directly; the tokenize command needs the transactional
@@ -129,11 +147,37 @@ export async function buildVaultContext(
     challenges,
   });
   const readAuditHistory = makeReadAuditHistory({ audit });
+  const enrollMfa = makeEnrollMfa({
+    keyManager,
+    totp,
+    mfa,
+    audit,
+    events,
+  });
+  const requestDetokenization = makeRequestDetokenization({
+    tokens,
+    identities,
+    mfa,
+    challenges,
+    audit,
+    events,
+  });
+  const approveStepUpChallenge = makeApproveStepUpChallenge({
+    keyManager,
+    totp,
+    mfa,
+    challenges,
+    audit,
+    events,
+  });
 
   const ctx: VaultContext = {
     tokenize,
     detokenize,
     readAuditHistory,
+    enrollMfa,
+    requestDetokenization,
+    approveStepUpChallenge,
     keyManagerInfo: keyManager.info(),
   };
 
@@ -183,6 +227,103 @@ export async function buildVaultContext(
     // shim's `DetokenizeResult` — same field set and types — so
     // it's safe to pass through without reshaping.
     return result;
+  });
+
+  // Install the in-process enrollMfa implementation on the
+  // legacy shim. After this returns, calls to
+  // `enrollMfa({actor, label, context, ...})` from the admin
+  // step-up flow go through the module, not HTTP.
+  __setEnrollMfaImpl(async (params) => {
+    const result = await enrollMfa({
+      actor: params.actor,
+      context: {
+        actorId: params.actor,
+        actorRole: params.context.actorRole,
+        reason: `MFA enrollment for ${params.actor} — ${params.context.email || 'fln admin'}`,
+        requestId: params.context.requestId,
+        sourceIp: params.context.sourceIp,
+        userAgent: params.context.userAgent,
+      },
+      ...(params.label !== undefined ? { label: params.label } : {}),
+      ...(params.algorithm !== undefined ? { algorithm: params.algorithm } : {}),
+      ...(params.digits !== undefined ? { digits: params.digits } : {}),
+      ...(params.period !== undefined ? { period: params.period } : {}),
+    });
+    // The command's `factor` is a typed `MfaFactor`; the shim's
+    // contract is `Record<string, unknown>` (it forwards the
+    // response as-is). Convert via a deliberate object spread
+    // so the call-site shape is stable.
+    const factorObj: Record<string, unknown> = {
+      factorId: result.factor.factorId,
+      actor: result.factor.actor,
+      factorType: result.factor.factorType,
+      status: result.factor.status,
+      label: result.factor.label,
+      algorithm: result.factor.algorithm,
+      digits: result.factor.digits,
+      period: result.factor.period,
+      lastUsedAt: result.factor.lastUsedAt,
+      expiresAt: result.factor.expiresAt,
+      createdAt: result.factor.createdAt,
+    };
+    return {
+      factorId: result.factorId,
+      otpauthUri: result.otpauthUri,
+      factor: factorObj,
+    };
+  });
+
+  // Install the in-process requestDetokenization implementation
+  // on the legacy shim. After this returns, calls to
+  // `requestDetokenization({tokenId, factorId, context})` from
+  // the admin step-up flow go through the module, not HTTP.
+  __setRequestDetokenizationImpl(async (params) => {
+    const result = await requestDetokenization({
+      tokenId: params.tokenId,
+      factorId: params.factorId,
+      context: {
+        actorId: params.context.email || 'fln-backend-service',
+        actorRole: params.context.actorRole,
+        reason: `Step-up challenge for admin detokenization — ${params.context.email || 'fln admin'}`,
+        requestId: params.context.requestId,
+        sourceIp: params.context.sourceIp,
+        userAgent: params.context.userAgent,
+      },
+    });
+    // The command returns a `Date` for `expiresAt`; the shim
+    // contract is an ISO string. Convert here.
+    return {
+      challengeId: result.challengeId,
+      expiresAt: result.expiresAt.toISOString(),
+      requiredFactor: result.requiredFactor as unknown as Record<string, unknown>,
+    };
+  });
+
+  // Install the in-process approveStepUpChallenge implementation
+  // on the legacy shim. After this returns, calls to
+  // `approveStepUpChallenge({challengeId, code, context})` from
+  // the admin step-up flow go through the module, not HTTP.
+  __setApproveStepUpChallengeImpl(async (params) => {
+    const result = await approveStepUpChallenge({
+      challengeId: params.challengeId,
+      code: params.code,
+      context: {
+        actorId: params.context.email || 'fln-backend-service',
+        actorRole: params.context.actorRole,
+        reason: `Step-up approval for admin detokenization — ${params.context.email || 'fln admin'}`,
+        requestId: params.context.requestId,
+        sourceIp: params.context.sourceIp,
+        userAgent: params.context.userAgent,
+      },
+    });
+    // The command returns a `Date` for `approvedAt`; the shim
+    // contract is an ISO string.
+    return {
+      challengeId: result.challengeId,
+      status: result.status,
+      approvedAt: result.approvedAt.toISOString(),
+      verifiedFactorId: result.verifiedFactorId,
+    };
   });
 
   return { ctx };

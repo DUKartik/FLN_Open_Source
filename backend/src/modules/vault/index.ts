@@ -32,6 +32,9 @@ import { buildVaultContext, type VaultContext } from './context';
 import { registerTokenizeRoute } from './routes/tokenize.routes';
 import { registerDetokenizeRoute } from './routes/detokenize.routes';
 import { registerAuditRoute } from './routes/audit.routes';
+import { registerMfaEnrollRoute } from './routes/mfa-enroll.routes';
+import { registerStepUpRequestRoute } from './routes/step-up-request.routes';
+import { registerStepUpApproveRoute } from './routes/step-up-approve.routes';
 import { requireScope } from './middleware';
 
 // Augment Express's `Application` so the wired vault context can be
@@ -104,6 +107,14 @@ export async function registerVaultRoutes(
   registerTokenizeRoute(router, app.vaultContext ?? null);
   registerDetokenizeRoute(router, app.vaultContext ?? null);
   registerAuditRoute(router, app.vaultContext ?? null);
+  // Phase 4: step-up + MFA + verifier routes. The tokenize /
+  // detokenize routes are the only ones actively used by the
+  // current FLN frontend; the step-up + MFA routes preserve the
+  // microservice's external HTTP contract for any future
+  // internal caller / monitoring / debugging.
+  registerMfaEnrollRoute(router, app.vaultContext ?? null);
+  registerStepUpRequestRoute(router, app.vaultContext ?? null);
+  registerStepUpApproveRoute(router, app.vaultContext ?? null);
   app.use(router);
 
   // Console readiness — Phase 5 mounts the static assets here. The

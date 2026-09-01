@@ -66,4 +66,19 @@ export async function ensureVaultIndexes(db: Db): Promise<void> {
       { expiresAt: 1 },
       { expireAfterSeconds: 3600 }, // 1h grace after expiresAt
     );
+
+  // vault_mfa_factors — Phase 4.
+  // PK is `factor_id` (the natural key); we store it on `_id`.
+  // Secondary indexes (mirroring the Postgres migration 003):
+  //   - actor+status: listActiveByActor (the detokenize hot path)
+  //   - actor+createdAt: listByActor (admin UI / audit)
+  await db.createCollection(VAULT_COLLECTIONS.mfaFactors).catch((err) => {
+    if (err?.codeName !== 'NamespaceExists') throw err;
+  });
+  await db
+    .collection(VAULT_COLLECTIONS.mfaFactors)
+    .createIndex({ actor: 1, status: 1 });
+  await db
+    .collection(VAULT_COLLECTIONS.mfaFactors)
+    .createIndex({ actor: 1, createdAt: -1 });
 }
