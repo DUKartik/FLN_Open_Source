@@ -34,22 +34,16 @@ delete process.env.MONGODB_URI;         // force the file-fallback store
 process.env.NODE_ENV = 'test';
 process.env.JWT_SECRET = 'dev-insecure-secret-change-me';
 process.env.SEED_DEMO_PASSWORD = 'Fln@2026';
-// Phase-2 in-process vault: the shim's default impl is the legacy HTTP
-// path (which would need a server + service JWT secret). We replace it
-// at boot via __setTokenizeAadhaarImpl, so the HTTP fallback never runs.
-// Still: keep the legacy secret out of the env so a stray call to the
-// default impl fails closed with a clear "not configured" error.
-delete process.env.AADHAAR_VAULT_SERVICE_JWT_SECRET;
-delete process.env.AADHAAR_VAULT_SERVICE_JWT_ISSUER;
-delete process.env.AADHAAR_VAULT_SERVICE_JWT_AUDIENCE;
-delete process.env.AADHAAR_VAULT_TIMEOUT_MS;
+// Phase-7 in-process vault: the shim's default impl throws `NOT_CONFIGURED`.
+// We replace it at boot via __setTokenizeAadhaarImpl, so the default never
+// runs. The in-process module is the only path; no HTTP fallback, no
+// service JWT, no feature flag.
 // In-process vault would need this if the module were enabled, but
-// the module is feature-flagged off in the test (no Mongo, no replica
+// the module is not enabled in this test (no Mongo, no replica
 // set) and we replace the tokenize impl directly. Keep the env unset
 // so `createKeyManager` would fail loud if the real module were
 // accidentally wired.
 delete process.env.LOCAL_DEV_MASTER_KEY;
-delete process.env.VAULT_MODULE_ENABLED;
 
 /** Deterministic stand-in for the vault's peppered subjectHash. */
 function fakeIdentityIdFor(digits: string): string {

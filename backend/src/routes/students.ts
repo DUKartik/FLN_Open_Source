@@ -319,9 +319,9 @@ export function registerStudentRoutes(app: express.Express) {
     }
 
     // Aadhaar uniqueness + tokenization — the raw 12-digit Aadhaar is never
-    // stored in MongoDB. We send it to the Aadhaar Vault (microservices/
-    // aadhaar-vault/) and persist only a mask, an opaque token, and the vault's
-    // deterministic identity id (see ../aadhaarVault.ts).
+    // stored in MongoDB. We send it to the in-process Aadhaar Vault
+    // (backend/src/modules/vault/) and persist only a mask, an opaque token,
+    // and the vault's deterministic identity id (see ../aadhaarVault.ts).
     const rawAadhar = String(aadharNumber).replace(/[^0-9]/g, '');
     if (!/^[0-9]{12}$/.test(rawAadhar)) {
       return { error: 'Invalid Aadhaar number. Expected 12 digits.' };

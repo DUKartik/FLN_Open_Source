@@ -1,6 +1,6 @@
 /**
  * EventPublisher port (ported verbatim from
- * microservices/aadhaar-vault/src/application/ports/event-publisher.ts).
+ * src/application/ports/event-publisher.ts).
  *
  * Domain events are published from the application layer (e.g. the
  * `TokenizeAadhaar` command publishes `AadhaarTokenized`). Adapters are

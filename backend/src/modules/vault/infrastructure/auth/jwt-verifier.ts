@@ -1,6 +1,6 @@
 /**
  * HS256 (HMAC-SHA256) JWT verifier adapter (ported verbatim from
- * microservices/aadhaar-vault/src/infrastructure/auth/hs256-jwt-verifier.ts).
+ * src/infrastructure/auth/hs256-jwt-verifier.ts).
  *
  * Implements the `JwtVerifier` port using a shared symmetric secret.
  * Suitable for internal/trusted-issuer deployments and for local dev.

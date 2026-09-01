@@ -2,7 +2,7 @@
  * `VerifyMfa` command — application-layer use case (Phase 4 port).
  *
  * Verbatim port of
- * `microservices/aadhaar-vault/src/application/commands/verify-mfa.ts`,
+ * `src/application/commands/verify-mfa.ts`,
  * adjusted only for:
  *   - relative import paths (no `.js` suffix; FLN backend ESM resolution)
  *   - the in-process `MfaFactorRepository` + `AuditRepository` ports

@@ -2,7 +2,7 @@
  * `DetokenizeAadhaar` command — Phase 3 port.
  *
  * Verbatim port of
- * `microservices/aadhaar-vault/src/application/commands/detokenize-aadhaar.ts`,
+ * `src/application/commands/detokenize-aadhaar.ts`,
  * adjusted only for:
  *   - relative import paths (no `.js` suffix; FLN backend ESM resolution)
  *   - the in-process `StepUpChallengeRepository` (no Fastify, no `pg`)

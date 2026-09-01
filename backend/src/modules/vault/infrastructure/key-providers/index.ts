@@ -1,6 +1,6 @@
 /**
  * KeyManager factory (simplified from
- * microservices/aadhaar-vault/src/infrastructure/key-providers/index.ts).
+ * src/infrastructure/key-providers/index.ts).
  *
  * The original factory took a `Config` object built by a separate
  * `loadConfig()` step. In the merged module we read env vars directly

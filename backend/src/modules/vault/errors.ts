@@ -2,7 +2,7 @@
 // VAULT MODULE — STABLE ERROR CODES
 // ==========================================
 // 22 stable error codes (plus 2 vault-internal ones) ported from
-// microservices/aadhaar-vault/src/routes/error-mapping.ts and the existing
+// src/routes/error-mapping.ts and the existing
 // mirror in backend/src/aadhaarVault.ts:KNOWN_VAULT_CODES. Every vault error
 // thrown anywhere in the module must use one of these codes; the HTTP layer
 // maps code → status via mapVaultErrorToHttp() in routes/.

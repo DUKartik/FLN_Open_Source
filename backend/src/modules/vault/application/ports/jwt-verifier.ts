@@ -1,7 +1,7 @@
 /**
  * JwtVerifier port — application-layer contract for verifying inbound JWTs
  * (ported verbatim from
- * microservices/aadhaar-vault/src/application/ports/jwt-verifier.ts).
+ * src/application/ports/jwt-verifier.ts).
  *
  * The verifier is intentionally minimal: it resolves a token to a strongly
  * typed `JwtPrincipal` (subject + scopes), or throws a typed error.

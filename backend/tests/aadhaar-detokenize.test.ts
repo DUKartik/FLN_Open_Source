@@ -35,26 +35,16 @@ delete process.env.MONGODB_URI;         // force the file-fallback store
 process.env.NODE_ENV = 'test';
 process.env.JWT_SECRET = 'dev-insecure-secret-change-me';
 process.env.SEED_DEMO_PASSWORD = 'Fln@2026';
-// The tokenize client refuses to mint a service JWT without this
-// (fail-closed). We replace the tokenize impl at boot, but the
-// default HTTP fallback still requires the env var to be present
-// (a stray call would surface NOT_CONFIGURED rather than UNREACHABLE).
-process.env.AADHAAR_VAULT_SERVICE_JWT_SECRET = 'test-only-hmac-secret-not-a-real-credential';
-delete process.env.AADHAAR_VAULT_SERVICE_JWT_ISSUER;
-delete process.env.AADHAAR_VAULT_SERVICE_JWT_AUDIENCE;
-delete process.env.AADHAAR_VAULT_TIMEOUT_MS;
-// Phase 4 in-process vault would need a real Mongo replica set to
-// run; the test environment is file-fallback only. The vault
-// module is NOT enabled here, and we install the in-process
-// impls directly via `__set*Impl`.
+// Phase-7 in-process vault: the shim's default impl throws `NOT_CONFIGURED`.
+// We install the in-process impls directly via `__set*Impl` for every
+// command the test exercises (tokenize, enrollMfa, requestDetokenization,
+// approveStepUpChallenge, detokenizeAadhaar). The in-process module is
+// the only path; no HTTP fallback, no service JWT, no feature flag.
+//
+// The in-process module would need a real Mongo replica set to run; the
+// test environment is file-fallback only. The module is NOT enabled
+// here, and we install the in-process impls directly via `__set*Impl`.
 delete process.env.LOCAL_DEV_MASTER_KEY;
-delete process.env.VAULT_MODULE_ENABLED;
-// The aadhaarDetokenize.ts route resolves the vault's URL from
-// this env var; without an HTTP vault, an unset value would
-// surface UNREACHABLE on a stray default-impl call. Set it to a
-// placeholder that no real server listens on, so any accidental
-// default-impl call fails fast with a clear "network" error.
-process.env.AADHAAR_VAULT_URL = 'http://127.0.0.1:1';
 
 // ─── TOTP helpers (RFC 6238 / HMAC-SHA1, 6 digits, 30s period) ────────────
 function totpCode(secretBytes: Buffer, time = Math.floor(Date.now() / 1000)): string {

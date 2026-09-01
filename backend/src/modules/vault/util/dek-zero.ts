@@ -1,6 +1,6 @@
 /**
  * Buffer-zeroing helpers (ported verbatim from
- * microservices/aadhaar-vault/src/util/dek-zero.ts).
+ * src/util/dek-zero.ts).
  *
  * DEK plaintexts must not linger in heap memory after a detokenize
  * finishes. Naive `buffer = Buffer.alloc(0)` does not zero the

@@ -1,6 +1,6 @@
 /**
  * LocalDevKeyManager (ported verbatim from
- * microservices/aadhaar-vault/src/infrastructure/key-providers/local-dev-key-manager.ts).
+ * src/infrastructure/key-providers/local-dev-key-manager.ts).
  *
  * Threat model:
  *   The master key is supplied via `LOCAL_DEV_MASTER_KEY` env. Anyone

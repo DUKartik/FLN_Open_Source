@@ -123,27 +123,27 @@ async function gracefulShutdown(signal: NodeJS.Signals, httpServer: import('http
     // 3. Drain in-flight vault transactions (defensive; should be
     //    a no-op because every vault write is awaited inside an
     //    HTTP handler that server.close() already waited for).
-    if (process.env.VAULT_MODULE_ENABLED === 'true') {
-      try {
-        const {
-          getActiveVaultTransactionCount,
-          waitForVaultTransactionsDrain,
-        } = await import('./modules/vault');
-        const pending = getActiveVaultTransactionCount();
-        if (pending > 0) {
-          console.log(`[shutdown] waiting for ${pending} in-flight vault transaction(s) to complete`);
-        }
-        const drained = await waitForVaultTransactionsDrain(DRAIN_TIMEOUT_MS);
-        if (!drained) {
-          console.warn(
-            `[shutdown] vault transaction drain timed out after ${DRAIN_TIMEOUT_MS}ms; ` +
-              `${getActiveVaultTransactionCount()} still pending. Mongo will be closed anyway.`,
-          );
-        }
-      } catch (err) {
-        // Vault module is not wired in this build. That's fine —
-        // the legacy HTTP path has nothing to drain.
+    try {
+      const {
+        getActiveVaultTransactionCount,
+        waitForVaultTransactionsDrain,
+      } = await import('./modules/vault');
+      const pending = getActiveVaultTransactionCount();
+      if (pending > 0) {
+        console.log(`[shutdown] waiting for ${pending} in-flight vault transaction(s) to complete`);
       }
+      const drained = await waitForVaultTransactionsDrain(DRAIN_TIMEOUT_MS);
+      if (!drained) {
+        console.warn(
+          `[shutdown] vault transaction drain timed out after ${DRAIN_TIMEOUT_MS}ms; ` +
+            `${getActiveVaultTransactionCount()} still pending. Mongo will be closed anyway.`,
+        );
+      }
+    } catch (err) {
+      // Module import failed (build corruption?). The legacy HTTP
+      // path had nothing to drain either; the comment is kept so a
+      // post-mortem reading the code sees the same invariant.
+      console.warn('[shutdown] vault drain module not loadable:', err);
     }
 
     // 4. Close the Mongo client. Re-imports here so the static
@@ -236,15 +236,11 @@ registerStatsRoutes(app);
   // Admin Step-Up detokenization (Aadhaar Vault — see aadhaarDetokenize.ts).
   registerAadhaarDetokenizeRoutes(app);
 
-  // In-process vault module (Phase 1 stub). Off by default; opt in via
-  // VAULT_MODULE_ENABLED=true. Progressive feature flag — the module's
-  // route surface grows across Phases 2-5; the flag is dropped in Phase 7
-  // once every path is wired. Dynamic import keeps the default dev path
-  // lightweight (no vault code is parsed unless the flag is on).
-  if (process.env.VAULT_MODULE_ENABLED === 'true') {
-    const { registerVaultRoutes } = await import('./modules/vault');
-    await registerVaultRoutes(app);
-  }
+  // In-process vault module — the only path (Phase 7 deletion of the
+  // standalone Fastify+Postgres microservice is complete). Always wired;
+  // the module is built and its routes are mounted unconditionally.
+  const { registerVaultRoutes } = await import('./modules/vault');
+  await registerVaultRoutes(app);
 
   registerEvaluationRoutes(app);
   registerWorksheetRoutes(app);

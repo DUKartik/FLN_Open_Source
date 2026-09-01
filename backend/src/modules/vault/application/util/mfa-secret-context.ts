@@ -1,7 +1,7 @@
 /**
  * MFA secret seal/open context — application-layer helper (ported
  * verbatim from
- * microservices/aadhaar-vault/src/application/util/mfa-secret-context.ts).
+ * src/application/util/mfa-secret-context.ts).
  *
  * The `KeyManager.sealSecret` / `KeyManager.openSecret` port requires
  * a "context" buffer that binds the wrapped output to a domain scope.

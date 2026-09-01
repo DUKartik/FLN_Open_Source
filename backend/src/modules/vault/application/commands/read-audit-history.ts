@@ -2,7 +2,7 @@
  * `ReadAuditHistory` command — application-layer use case (Phase 3 port).
  *
  * Verbatim port of
- * `microservices/aadhaar-vault/src/application/commands/read-audit-history.ts`,
+ * `src/application/commands/read-audit-history.ts`,
  * with one shape change: `ReadAuditHistoryEntry.auditId` is `string`
  * (a stringified ObjectId) rather than `number` (a Postgres
  * BIGSERIAL). The new `AuditRecord.auditId` is a string in the Mongo

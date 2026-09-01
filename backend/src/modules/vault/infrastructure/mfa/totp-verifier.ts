@@ -1,6 +1,6 @@
 /**
  * RFC 6238 TOTP verifier adapter (ported verbatim from
- * microservices/aadhaar-vault/src/infrastructure/mfa/totp-verifier.ts).
+ * src/infrastructure/mfa/totp-verifier.ts).
  *
  * Implementation strategy
  * -----------------------

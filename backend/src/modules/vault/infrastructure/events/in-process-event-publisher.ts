@@ -1,6 +1,6 @@
 /**
  * In-process EventPublisher adapter (ported verbatim from
- * microservices/aadhaar-vault/src/infrastructure/events/in-process-event-publisher.ts).
+ * src/infrastructure/events/in-process-event-publisher.ts).
  *
  * Fire-and-forget within the request lifetime — events are emitted to
  * the supplied logger at info level. There is no delivery guarantee

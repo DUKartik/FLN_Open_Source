@@ -1,7 +1,7 @@
 /**
  * `safeZero` — application-layer helper that overwrites the contents
  * of a `Buffer` with zeros. Verbatim port of
- * `microservices/aadhaar-vault/src/application/util/dek-zero.ts`.
+ * `src/application/util/dek-zero.ts`.
  *
  * Used by the tokenize / detokenize / enroll-mfa / approve-step-up
  * commands to zero any `Buffer` that briefly held plaintext

@@ -9,8 +9,9 @@
 //
 // # Security model
 //
-//   1. The browser NEVER holds the vault service JWT. Every vault call here
-//      is signed by the backend using `AADHAAR_VAULT_SERVICE_JWT_SECRET`.
+//   1. The browser NEVER holds a vault credential. Every vault call here
+//      runs entirely in-process (backend/src/modules/vault/) — there is
+//      no service-to-service JWT to mint or verify.
 //   2. The browser NEVER directly authenticates to the vault. The browser
 //      only talks to this Express layer.
 //   3. Plain tokenization (registration) does NOT require MFA. Detokenization

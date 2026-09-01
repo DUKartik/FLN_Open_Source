@@ -23,7 +23,7 @@ export type VaultScope =
   | 'vault:audit';      // GET  /v1/audit
 
 // Paths that bypass auth. Mirrors the vault's publicUrlPrefixes
-// (microservices/aadhaar-vault/src/server.ts:386). The /console/* prefix is
+// (src/server.ts:386). The /console/* prefix is
 // used by the developer UI (Phase 5); /health/* are the readiness probes.
 const PUBLIC_PATH_PREFIXES = ['/console/', '/health'];
 

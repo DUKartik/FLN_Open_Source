@@ -30,9 +30,12 @@
  *
  * Isolation model: same as aadhaar-detokenize.test.ts — chdir into a
  * fresh temp dir, delete MONGODB_URI so any stray dbStore import falls
- * back to the file-based store. The vault module is NOT enabled
- * (VAULT_MODULE_ENABLED unset); we wire the deps ourselves so no
- * Mongo replica set is required.
+ * back to the file-based store. The vault module is NOT enabled here
+ * (no Mongo replica set in this test environment); we wire the deps
+ * ourselves with in-memory repos and the real LocalDevKeyManager /
+ * NodeCryptoService / OtpAuthTotpVerifier, so the production
+ * command-bound code paths are exercised end-to-end without a Mongo
+ * replica set.
  *
  * Run:  npx tsx --test backend/src/modules/vault/tests/step-up-e2e.test.ts
  *       (or via `npm test` after the test:detokenize script is
@@ -46,7 +49,6 @@ import { randomBytes, randomUUID } from 'node:crypto';
 process.env.NODE_ENV = 'test';
 process.env.LOCAL_DEV_MASTER_KEY = randomBytes(32).toString('base64');
 process.env.KEY_VERSION = 'kv-1';
-process.env.AADHAAR_VAULT_URL = 'http://127.0.0.1:1'; // no real listener
 
 // ─── Imports — vault-only, no Mongo, no Express, no file-fallback DB ────────
 import { LocalDevKeyManager } from '../infrastructure/key-providers/local-dev-key-manager';

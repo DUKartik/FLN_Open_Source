@@ -1,6 +1,6 @@
 /**
  * TOTP (RFC 6238) verifier port (ported verbatim from
- * microservices/aadhaar-vault/src/application/ports/totp-verifier.ts).
+ * src/application/ports/totp-verifier.ts).
  *
  * The application layer needs a small surface to:
  *   1. Generate a fresh TOTP shared secret at enrollment and the

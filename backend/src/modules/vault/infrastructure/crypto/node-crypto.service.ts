@@ -1,6 +1,6 @@
 /**
  * NodeCryptoService — AES-256-GCM adapter (ported verbatim from
- * microservices/aadhaar-vault/src/infrastructure/crypto/node-crypto.service.ts).
+ * src/infrastructure/crypto/node-crypto.service.ts).
  *
  * Production implementation of the `CryptoService` port backed by
  * `node:crypto`. We deliberately stay on the standard library so the

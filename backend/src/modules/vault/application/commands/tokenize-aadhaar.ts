@@ -1,7 +1,7 @@
 /**
  * `TokenizeAadhaar` command — application-layer use case
  * (ported verbatim from
- * microservices/aadhaar-vault/src/application/commands/tokenize-aadhaar.ts,
+ * src/application/commands/tokenize-aadhaar.ts,
  * with `.js` import suffixes stripped for the FLN backend's ESM
  * resolution).
  *

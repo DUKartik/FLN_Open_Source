@@ -1,6 +1,6 @@
 /**
  * Repository port interfaces (consolidated from
- * microservices/aadhaar-vault/src/db/ports/*.ts).
+ * src/db/ports/*.ts).
  *
  * In the original microservice each repository lived in its own file.
  * Here we consolidate the three needed for Phase 2 (tokenize) into one

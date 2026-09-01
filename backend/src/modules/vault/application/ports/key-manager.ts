@@ -1,6 +1,6 @@
 /**
  * KeyManager port (ported verbatim from
- * microservices/aadhaar-vault/src/application/ports/key-manager.ts).
+ * src/application/ports/key-manager.ts).
  *
  * The minimal cryptographic boundary the rest of the application
  * needs to wrap and unwrap Data Encryption Keys (DEKs). The port is

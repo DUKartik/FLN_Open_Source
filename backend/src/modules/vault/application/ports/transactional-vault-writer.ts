@@ -1,6 +1,6 @@
 /**
  * Transactional write unit-of-work (ported verbatim from
- * microservices/aadhaar-vault/src/application/ports/transactional-vault-writer.ts).
+ * src/application/ports/transactional-vault-writer.ts).
  *
  * The command writes to three collections — `vault_identities`, `vault_tokens`,
  * `vault_audit_log` — and these three writes must succeed **or fail

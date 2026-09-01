@@ -1,6 +1,6 @@
 /**
  * CryptoService port (ported verbatim from
- * microservices/aadhaar-vault/src/application/ports/crypto.service.ts).
+ * src/application/ports/crypto.service.ts).
  *
  * The tokenization envelope (per §8.1 step 4) is:
  *

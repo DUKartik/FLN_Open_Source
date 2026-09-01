@@ -2,7 +2,7 @@
  * `ApproveStepUpChallenge` command — application-layer use case (Phase 4 port).
  *
  * Verbatim port of
- * `microservices/aadhaar-vault/src/application/commands/approve-step-up-challenge.ts`,
+ * `src/application/commands/approve-step-up-challenge.ts`,
  * adjusted only for:
  *   - relative import paths (no `.js` suffix; FLN backend ESM resolution)
  *   - the in-process `StepUpChallengeRepository` / `MfaFactorRepository`
