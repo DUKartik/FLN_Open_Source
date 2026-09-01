@@ -12,9 +12,6 @@ export const VAULT_COLLECTIONS = {
    *  if a re-tokenization is requested, but in v0.1 each call mints
    *  exactly one token per identity. */
   tokens: 'vault_tokens',
-  /** Append-only audit chain. `auditId` (a stringified ObjectId) is
-   *  the row's `_id`. */
-  auditLog: 'vault_audit_log',
   /** (Phase 3) Step-up challenges. CAS via findOneAndUpdate. */
   stepUpChallenges: 'vault_step_up_challenges',
   /** (Phase 4) TOTP factors. */

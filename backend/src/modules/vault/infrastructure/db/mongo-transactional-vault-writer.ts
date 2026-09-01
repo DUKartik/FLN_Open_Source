@@ -27,7 +27,6 @@ import type {
 } from '../../application/ports/transactional-vault-writer';
 import { MongoIdentityRepository } from './mongo-identity.repository';
 import { MongoTokenRepository } from './mongo-token.repository';
-import { MongoAuditRepository } from './mongo-audit.repository';
 import { acquire, release } from './vault-transaction-counter';
 
 // Driver error messages that mean "this MongoDB deployment cannot
@@ -68,8 +67,17 @@ export class MongoTransactionalVaultWriter implements TransactionalVaultWriter {
               new MongoIdentityRepository(this.db, session).insert(rec).then(() => undefined),
             insertToken: (token) =>
               new MongoTokenRepository(this.db, session).insert(token),
-            appendAudit: (entry) =>
-              new MongoAuditRepository(this.db, session).append(entry).then(() => undefined),
+            writeLog: (entry) =>
+              // Audit row goes to the FLN `logbook` collection inside
+              // the same session as the identity / token inserts, so
+              // the audit row commits or rolls back atomically with
+              // them. The caller has already shaped the LogEntry (see
+              // backend/src/modules/vault/audit/logbook-entry.ts); this
+              // method just persists it.
+              this.db
+                .collection('logbook')
+                .insertOne(entry, { session })
+                .then(() => undefined),
           };
           result = await work(conn);
         });

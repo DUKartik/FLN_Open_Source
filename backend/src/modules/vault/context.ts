@@ -28,7 +28,6 @@ import { InProcessEventPublisher } from './infrastructure/events/in-process-even
 import { MongoTransactionalVaultWriter } from './infrastructure/db/mongo-transactional-vault-writer';
 import { MongoIdentityRepository } from './infrastructure/db/mongo-identity.repository';
 import { MongoTokenRepository } from './infrastructure/db/mongo-token.repository';
-import { MongoAuditRepository } from './infrastructure/db/mongo-audit.repository';
 import { MongoStepUpChallengeRepository } from './infrastructure/db/mongo-step-up-challenge.repository';
 import { MongoMfaFactorRepository } from './infrastructure/db/mongo-mfa-factor.repository';
 import { ensureVaultIndexes } from './schema/indexes';
@@ -114,12 +113,14 @@ export async function buildVaultContext(
   const vaultWriter = new MongoTransactionalVaultWriter(input.db, input.client);
 
   // Repositories (all read-side; writes go through vaultWriter
-  // for the tokenize path). Identity + token + audit + challenge
-  // + mfa are the five collections the detokenize + step-up paths
-  // walk.
+  // for the tokenize path). Identity + token + challenge + mfa
+  // are the four collections the detokenize + step-up paths walk.
+  // The audit chain is the FLN `logbook` collection, written
+  // by the commands themselves via `dbStore.addLog` /
+  // `dbStore.addLogInSession` — there is no `audit` repo
+  // anymore (issue #406).
   const identities = new MongoIdentityRepository(input.db);
   const tokens = new MongoTokenRepository(input.db);
-  const audit = new MongoAuditRepository(input.db);
   const challenges = new MongoStepUpChallengeRepository(input.db);
   const mfa = new MongoMfaFactorRepository(input.db);
 
@@ -130,7 +131,9 @@ export async function buildVaultContext(
 
   // Commands. The detokenize command needs the read-side repos
   // directly; the tokenize command needs the transactional
-  // writer (so identity + token + audit land atomically).
+  // writer (so identity + token + logbook audit land
+  // atomically). The audit chain is the FLN `logbook`
+  // collection, written by the commands themselves.
   const tokenize = makeTokenizeAadhaar({
     keyManager,
     crypto,
@@ -142,16 +145,14 @@ export async function buildVaultContext(
     crypto,
     tokens,
     identities,
-    audit,
     events,
     challenges,
   });
-  const readAuditHistory = makeReadAuditHistory({ audit });
+  const readAuditHistory = makeReadAuditHistory({});
   const enrollMfa = makeEnrollMfa({
     keyManager,
     totp,
     mfa,
-    audit,
     events,
   });
   const requestDetokenization = makeRequestDetokenization({
@@ -159,7 +160,6 @@ export async function buildVaultContext(
     identities,
     mfa,
     challenges,
-    audit,
     events,
   });
   const approveStepUpChallenge = makeApproveStepUpChallenge({
@@ -167,7 +167,6 @@ export async function buildVaultContext(
     totp,
     mfa,
     challenges,
-    audit,
     events,
   });
 

@@ -62,14 +62,14 @@
 import type { KeyManager } from "../ports/key-manager";
 import type { TotpVerifier } from "../ports/totp-verifier";
 import type {
-  AuditEntry,
-  AuditRepository,
   MfaFactor,
   MfaFactorRepository,
 } from "../ports/repositories";
 import type { EventPublisher } from "../ports/event-publisher";
+import { dbStore } from "../../../../db";
 import { safeZero } from "../../util/dek-zero";
 import { makeMfaSecretContext } from "../util/mfa-secret-context";
+import { mintVaultLogId, vaultLogbookEntry } from "../../audit/logbook-entry";
 
 // ---------------------------------------------------------------------------
 // Public types — the "verify MFA" contract surface
@@ -92,6 +92,12 @@ export interface VerifyMfaCallerContext {
   requestId?: string;
   sourceIp?: string;
   userAgent?: string;
+  /** Denormalised fields the logbook row carries for display /
+   *  filtering. Populated by the route layer from the
+   *  authenticated user; left empty for the SERVICE actor. */
+  userId?: string;
+  schoolId?: string;
+  schoolName?: string;
 }
 
 /**
@@ -212,7 +218,6 @@ export interface VerifyMfaDeps {
   keyManager: KeyManager;
   totp: TotpVerifier;
   mfa: MfaFactorRepository;
-  audit: AuditRepository;
   events: EventPublisher;
   /**
    * Returns the *current* "now" — injected so tests can pin
@@ -430,23 +435,35 @@ export function makeVerifyMfa(deps: VerifyMfaDeps) {
       // 8. Append the audit row + publish the success
       //    event.
       // -------------------------------------------------------------
-      await deps.audit.append({
-        identityId: null,
-        actor: cmd.context.actorId,
-        action: "MFA_VERIFY",
-        outcome: "allow",
-        reason: cmd.context.reason,
-        requestId: cmd.context.requestId ?? null,
-        meta: {
-          factor_id: factor.factorId,
-          factor_type: factor.factorType,
-          factor_actor: factor.actor,
-          delta: result.delta,
-          window,
-          source_ip: cmd.context.sourceIp ?? null,
-          user_agent: cmd.context.userAgent ?? null,
-        },
-      });
+      await dbStore.addLog(
+        vaultLogbookEntry(
+          {
+            identityId: null,
+            actor: cmd.context.actorId,
+            action: "MFA_VERIFY",
+            outcome: "allow",
+            reason: cmd.context.reason,
+            requestId: cmd.context.requestId ?? null,
+            meta: {
+              factor_id: factor.factorId,
+              factor_type: factor.factorType,
+              factor_actor: factor.actor,
+              delta: result.delta,
+              window,
+              source_ip: cmd.context.sourceIp ?? null,
+              user_agent: cmd.context.userAgent ?? null,
+            },
+          },
+          {
+            userId: cmd.context.userId ?? '',
+            schoolId: cmd.context.schoolId ?? '',
+            schoolName: cmd.context.schoolName ?? '',
+            actorRole: cmd.context.actorRole,
+          },
+          mintVaultLogId(now),
+          now,
+        ),
+      );
 
       await deps.events.publish({
         type: "MfaVerified",
@@ -495,22 +512,33 @@ async function recordFailure(
   const factorId = factor?.factorId ?? cmd.factorId;
   const factorActor = factor?.actor ?? null;
 
-  const auditEntry: AuditEntry = {
-    identityId: null,
-    actor: cmd.context.actorId,
-    action: "MFA_VERIFY",
-    outcome: "deny",
-    reason: cmd.context.reason,
-    requestId: cmd.context.requestId ?? null,
-    meta: {
-      factor_id: factorId,
-      factor_actor: factorActor,
-      failure_reason: reason,
-      source_ip: cmd.context.sourceIp ?? null,
-      user_agent: cmd.context.userAgent ?? null,
-    },
-  };
-  await deps.audit.append(auditEntry);
+  await dbStore.addLog(
+    vaultLogbookEntry(
+      {
+        identityId: null,
+        actor: cmd.context.actorId,
+        action: "MFA_VERIFY",
+        outcome: "deny",
+        reason: cmd.context.reason,
+        requestId: cmd.context.requestId ?? null,
+        meta: {
+          factor_id: factorId,
+          factor_actor: factorActor,
+          failure_reason: reason,
+          source_ip: cmd.context.sourceIp ?? null,
+          user_agent: cmd.context.userAgent ?? null,
+        },
+      },
+      {
+        userId: cmd.context.userId ?? '',
+        schoolId: cmd.context.schoolId ?? '',
+        schoolName: cmd.context.schoolName ?? '',
+        actorRole: cmd.context.actorRole,
+      },
+      mintVaultLogId(now),
+      now,
+    ),
+  );
 
   await deps.events.publish({
     type: "MfaVerificationFailed",

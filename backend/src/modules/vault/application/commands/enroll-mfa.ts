@@ -45,14 +45,14 @@ import type {
   TotpVerifier,
 } from "../ports/totp-verifier";
 import type {
-  AuditEntry,
-  AuditRepository,
   MfaFactor,
   MfaFactorRepository,
 } from "../ports/repositories";
 import type { EventPublisher } from "../ports/event-publisher";
+import { dbStore } from "../../../../db";
 import { safeZero } from "../../util/dek-zero";
 import { makeMfaSecretContext } from "../util/mfa-secret-context";
+import { mintVaultLogId, vaultLogbookEntry } from "../../audit/logbook-entry";
 
 // ---------------------------------------------------------------------------
 // Public types — the "enroll MFA" contract surface
@@ -75,6 +75,12 @@ export interface EnrollMfaCallerContext {
   requestId?: string;
   sourceIp?: string;
   userAgent?: string;
+  /** Denormalised fields the logbook row carries for display /
+   *  filtering. Populated by the route layer from the
+   *  authenticated user; left empty for the SERVICE actor. */
+  userId?: string;
+  schoolId?: string;
+  schoolName?: string;
 }
 
 /**
@@ -156,7 +162,6 @@ export interface EnrollMfaDeps {
   keyManager: KeyManager;
   totp: TotpVerifier;
   mfa: MfaFactorRepository;
-  audit: AuditRepository;
   events: EventPublisher;
   /**
    * Returns the *current* "now" — injected so tests can pin
@@ -288,29 +293,45 @@ export function makeEnrollMfa(deps: EnrollMfaDeps) {
       //    row. The HTTP layer / runtime logger can
       //    surface the append failure separately.
       // -------------------------------------------------------------
-      const auditEntry: AuditEntry = {
-        identityId: null,
-        actor: cmd.context.actorId,
-        action: "MFA_ENROLL",
-        outcome: "allow",
-        reason: cmd.context.reason,
-        requestId: cmd.context.requestId ?? null,
-        meta: {
-          factor_id: factorId,
-          factor_type: "totp",
-          factor_actor: cmd.actor,
-          label,
-          algorithm: effectiveAlgorithm,
-          digits: effectiveDigits,
-          period: effectivePeriod,
-          admin_actor: cmd.context.actorId,
-          admin_role: cmd.context.actorRole,
-          source_ip: cmd.context.sourceIp ?? null,
-          user_agent: cmd.context.userAgent ?? null,
-        },
-      };
+      // Per issue #406's review, the audit sink is the FLN
+      // `logbook` collection (via `dbStore.addLog`), not a
+      // separate `vault_audit_log` table. The mapping helper
+      // shapes the `LogEntry` and strips any plaintext Aadhaar
+      // defensively.
       try {
-        await deps.audit.append(auditEntry);
+        await dbStore.addLog(
+          vaultLogbookEntry(
+            {
+              identityId: null,
+              actor: cmd.context.actorId,
+              action: "MFA_ENROLL",
+              outcome: "allow",
+              reason: cmd.context.reason,
+              requestId: cmd.context.requestId ?? null,
+              meta: {
+                factor_id: factorId,
+                factor_type: "totp",
+                factor_actor: cmd.actor,
+                label,
+                algorithm: effectiveAlgorithm,
+                digits: effectiveDigits,
+                period: effectivePeriod,
+                admin_actor: cmd.context.actorId,
+                admin_role: cmd.context.actorRole,
+                source_ip: cmd.context.sourceIp ?? null,
+                user_agent: cmd.context.userAgent ?? null,
+              },
+            },
+            {
+              userId: cmd.context.userId ?? '',
+              schoolId: cmd.context.schoolId ?? '',
+              schoolName: cmd.context.schoolName ?? '',
+              actorRole: cmd.context.actorRole,
+            },
+            mintVaultLogId(now),
+            now,
+          ),
+        );
       } catch (auditErr) {
         // Re-throw to keep the contract symmetrical
         // with the rest of the codebase: append

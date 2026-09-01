@@ -26,14 +26,15 @@ export async function ensureVaultIndexes(db: Db): Promise<void> {
   });
   await db.collection(VAULT_COLLECTIONS.tokens).createIndex({ identityId: 1 });
 
-  // vault_audit_log — listByIdentity is the read path; sort by
-  // occurredAt desc. Compound index supports both.
-  await db.createCollection(VAULT_COLLECTIONS.auditLog).catch((err) => {
-    if (err?.codeName !== 'NamespaceExists') throw err;
-  });
-  await db
-    .collection(VAULT_COLLECTIONS.auditLog)
-    .createIndex({ identityId: 1, occurredAt: -1 });
+  // vault_audit_log — REMOVED. Per issue #406's review, the vault
+  // audit chain is unified onto the FLN `logbook` collection (the
+  // existing activity-log table). The vault module writes audit
+  // rows via `dbStore.addLog` / `dbStore.addLogInSession` — there
+  // is no separate `vault_audit_log` collection, and no
+  // `auditId`-keyed index to maintain. Operators with an old
+  // `vault_audit_log` collection in Mongo from a prior deployment
+  // can drop it out of band; the schema ensure on boot no longer
+  // touches it.
 
   // vault_step_up_challenges — Phase 3.
   // PK is `challenge_id` (the natural key); we store it on `_id`.

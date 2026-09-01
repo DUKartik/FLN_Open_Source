@@ -69,35 +69,16 @@ export interface TokenRepository {
 // ---------------------------------------------------------------------------
 // Audit repository
 // ---------------------------------------------------------------------------
-export type AuditOutcome = 'allow' | 'deny' | 'error';
-
-export interface AuditEntry {
-  identityId: string | null;
-  actor: string;
-  action: string;
-  outcome: AuditOutcome;
-  reason?: string | null;
-  requestId?: string | null;
-  meta?: Record<string, unknown>;
-}
-
-export interface AuditRecord extends AuditEntry {
-  auditId: string;
-  occurredAt: Date;
-}
-
-export interface AuditRepository {
-  /**
-   * Append an audit row. Returns the assigned `auditId` (a stringified
-   * ObjectId) so the caller can link related rows. Throws on DB failure;
-   * never returns `null` / `undefined`.
-   */
-  append(entry: AuditEntry): Promise<string>;
-  listByIdentity(
-    identityId: string,
-    opts?: { limit?: number },
-  ): Promise<AuditRecord[]>;
-}
+// The original Phase 2 port defined a separate `AuditRepository` that
+// wrote to a dedicated `vault_audit_log` Mongo collection. Per issue
+// #406's review, the vault audit chain has been unified onto the FLN
+// `logbook` collection via `dbStore.addLog` / `dbStore.addLogInSession`
+// (see `backend/src/modules/vault/audit/logbook-entry.ts` for the
+// mapping). The old port interface, the `AuditEntry` / `AuditRecord`
+// types, and the `MongoAuditRepository` adapter are all gone; the
+// `VaultWriteConnection.writeLog` method is the only seam the
+// transactional writer exposes, and it accepts the FLN `LogEntry`
+// shape directly.
 
 // ---------------------------------------------------------------------------
 // Step-up challenge repository (Phase 3)

@@ -44,8 +44,6 @@
  */
 import { randomUUID } from "node:crypto";
 import type {
-  AuditEntry,
-  AuditRepository,
   IdentityRecord,
   IdentityRepository,
   MfaFactor,
@@ -56,6 +54,8 @@ import type {
   TokenRepository,
 } from "../ports/repositories";
 import type { DomainEvent, EventPublisher } from "../ports/event-publisher";
+import { dbStore } from "../../../../db";
+import { mintVaultLogId, vaultLogbookEntry } from "../../audit/logbook-entry";
 
 // ---------------------------------------------------------------------------
 // Public types — the "request detokenization" contract surface
@@ -78,6 +78,12 @@ export interface RequestDetokenizationCallerContext {
   requestId?: string;
   sourceIp?: string;
   userAgent?: string;
+  /** Denormalised fields the logbook row carries for display /
+   *  filtering. Populated by the route layer from the
+   *  authenticated user; left empty for the SERVICE actor. */
+  userId?: string;
+  schoolId?: string;
+  schoolName?: string;
 }
 
 /**
@@ -174,7 +180,6 @@ export interface RequestDetokenizationDeps {
   identities: IdentityRepository;
   mfa: MfaFactorRepository;
   challenges: StepUpChallengeRepository;
-  audit: AuditRepository;
   events: EventPublisher;
   /**
    * Returns the *current* "now" — injected so tests can pin
@@ -330,28 +335,39 @@ export function makeRequestDetokenization(deps: RequestDetokenizationDeps) {
     });
 
     // -----------------------------------------------------------------
-    // 6. Append the audit row.
+    // 6. Append the audit row to the FLN `logbook` collection.
     // -----------------------------------------------------------------
-    const auditEntry: AuditEntry = {
-      identityId: identityRow.identityId,
-      actor: cmd.context.actorId,
-      action: "STEP_UP_REQUEST",
-      outcome: "allow",
-      reason: cmd.context.reason,
-      requestId: cmd.context.requestId ?? null,
-      meta: {
-        challenge_id: challenge.challengeId,
-        token_id: tokenRow.id,
-        operation: "detokenize",
-        required_factor_id: factor.factorId,
-        required_factor_actor: factor.actor,
-        required_factor_type: factor.factorType,
-        expires_at: expiresAt.toISOString(),
-        source_ip: cmd.context.sourceIp ?? null,
-        user_agent: cmd.context.userAgent ?? null,
-      },
-    };
-    await deps.audit.append(auditEntry);
+    await dbStore.addLog(
+      vaultLogbookEntry(
+        {
+          identityId: identityRow.identityId,
+          actor: cmd.context.actorId,
+          action: "STEP_UP_REQUEST",
+          outcome: "allow",
+          reason: cmd.context.reason,
+          requestId: cmd.context.requestId ?? null,
+          meta: {
+            challenge_id: challenge.challengeId,
+            token_id: tokenRow.id,
+            operation: "detokenize",
+            required_factor_id: factor.factorId,
+            required_factor_actor: factor.actor,
+            required_factor_type: factor.factorType,
+            expires_at: expiresAt.toISOString(),
+            source_ip: cmd.context.sourceIp ?? null,
+            user_agent: cmd.context.userAgent ?? null,
+          },
+        },
+        {
+          userId: cmd.context.userId ?? '',
+          schoolId: cmd.context.schoolId ?? '',
+          schoolName: cmd.context.schoolName ?? '',
+          actorRole: cmd.context.actorRole,
+        },
+        mintVaultLogId(now),
+        now,
+      ),
+    );
 
     // -----------------------------------------------------------------
     // 7. Publish the domain event.

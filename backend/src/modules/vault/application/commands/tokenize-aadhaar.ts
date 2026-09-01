@@ -52,6 +52,7 @@ import type { KeyManager } from '../ports/key-manager';
 import type { CryptoService } from '../ports/crypto.service';
 import type { EventPublisher } from '../ports/event-publisher';
 import { safeZero } from '../../util/dek-zero';
+import { vaultLogbookEntry } from '../../audit/logbook-entry';
 
 // ---------------------------------------------------------------------------
 // Public types — the §6.1 contract surface
@@ -74,6 +75,12 @@ export type TokenizeIdentityType = 'AADHAAR' | 'BIRTH_CERTIFICATE';
  * or an upstream correlation id. `actorRole` is one of the
  * well-known RBAC tags; kept as a string union so future roles don't
  * require a code change here.
+ *
+ * `userId`, `schoolId`, `schoolName` are denormalised fields the
+ * `logbook` row carries for display and filtering. The route layer
+ * populates them from the authenticated user; the SERVICE actor
+ * (e.g. the backend registering a student on behalf of a teacher)
+ * leaves them empty and the mapping helper falls back to 'system'.
  */
 export interface TokenizeCallerContext {
   actorId: string;
@@ -87,6 +94,9 @@ export interface TokenizeCallerContext {
   requestId?: string;
   sourceIp?: string;
   userAgent?: string;
+  userId?: string;
+  schoolId?: string;
+  schoolName?: string;
 }
 
 /**
@@ -344,24 +354,42 @@ export function makeTokenizeAadhaar(deps: TokenizeAadhaarDeps) {
           wrappedDek: dekWrapped,
         });
 
-        await conn.appendAudit({
-          identityId,
-          actor: cmd.context.actorId,
-          action: 'TOKENIZE',
-          outcome: 'allow',
-          reason: cmd.context.reason,
-          requestId: cmd.context.requestId ?? null,
-          meta: {
-            actor_role: cmd.context.actorRole,
-            token_type: cmd.type,
-            token_id: tokenId,
-            last4,
-            key_version: dekKeyVersion,
-            envelope_schema_version: ENVELOPE_SCHEMA_VERSION,
-            source_ip: cmd.context.sourceIp ?? null,
-            user_agent: cmd.context.userAgent ?? null,
-          },
-        });
+        // Audit row goes to the FLN `logbook` collection inside the
+        // same Mongo session as the identity + token inserts, so the
+        // audit row commits or rolls back atomically with them. The
+        // `auditId` (the synthetic LogEntry.id) is also the value
+        // returned to the caller, so downstream tools can stitch the
+        // tokenize response to the logbook row.
+        await conn.writeLog(
+          vaultLogbookEntry(
+            {
+              identityId,
+              actor: cmd.context.actorId,
+              action: 'TOKENIZE',
+              outcome: 'allow',
+              reason: cmd.context.reason,
+              requestId: cmd.context.requestId ?? null,
+              meta: {
+                actor_role: cmd.context.actorRole,
+                token_type: cmd.type,
+                token_id: tokenId,
+                last4,
+                key_version: dekKeyVersion,
+                envelope_schema_version: ENVELOPE_SCHEMA_VERSION,
+                source_ip: cmd.context.sourceIp ?? null,
+                user_agent: cmd.context.userAgent ?? null,
+              },
+            },
+            {
+              userId: cmd.context.userId ?? '',
+              schoolId: cmd.context.schoolId ?? '',
+              schoolName: cmd.context.schoolName ?? '',
+              actorRole: cmd.context.actorRole,
+            },
+            auditId,
+            now,
+          ),
+        );
       });
 
       // -------------------------------------------------------------

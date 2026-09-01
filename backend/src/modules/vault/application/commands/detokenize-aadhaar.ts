@@ -6,9 +6,12 @@
  * adjusted only for:
  *   - relative import paths (no `.js` suffix; FLN backend ESM resolution)
  *   - the in-process `StepUpChallengeRepository` (no Fastify, no `pg`)
- *   - the new `AuditRepository.append` returns `string` (stringified
- *     ObjectId) instead of `number` (BIGSERIAL) — the audit row id is
- *     still NOT surfaced to the response, only stamped into the meta.
+ *   - the audit row is written via `dbStore.addLog` against the FLN
+ *     `logbook` collection (issue #406) — there is no separate
+ *     `AuditRepository` port anymore. The audit row id is stamped
+ *     into the meta and recorded in the challenge row's `audit_id`
+ *     column (via the upstream `approveStepUpChallenge` call site)
+ *     for chain correlation.
  *
  * This is the *final* leg of the step-up detokenize pipeline. The
  * challenge row is the single source of truth for authorisation:
@@ -52,16 +55,14 @@ import type {
   IdentityRecord,
   IdentityRepository,
 } from '../ports/repositories';
-import type {
-  AuditEntry,
-  AuditRepository,
-} from '../ports/repositories';
 import type { TokenRepository } from '../ports/repositories';
 import type { KeyManager } from '../ports/key-manager';
 import type { CryptoService } from '../ports/crypto.service';
 import type { EventPublisher } from '../ports/event-publisher';
 import type { StepUpChallengeRepository } from '../ports/repositories';
+import { dbStore } from '../../../../db';
 import { safeZero } from '../../util/dek-zero';
+import { mintVaultLogId, vaultLogbookEntry } from '../../audit/logbook-entry';
 
 // ---------------------------------------------------------------------------
 // Public types — the detokenize command's contract surface
@@ -88,6 +89,12 @@ export interface DetokenizeCallerContext {
   requestId?: string;
   sourceIp?: string;
   userAgent?: string;
+  /** Denormalised fields the logbook row carries for display /
+   *  filtering. Populated by the route layer from the
+   *  authenticated user; left empty for the SERVICE actor. */
+  userId?: string;
+  schoolId?: string;
+  schoolName?: string;
 }
 
 /**
@@ -218,7 +225,6 @@ export interface DetokenizeAadhaarDeps {
   crypto: CryptoService;
   tokens: TokenRepository;
   identities: IdentityRepository;
-  audit: AuditRepository;
   events: EventPublisher;
   challenges: StepUpChallengeRepository;
   clock?: () => Date;
@@ -522,27 +528,43 @@ export function makeDetokenizeAadhaar(deps: DetokenizeAadhaarDeps) {
           ? challenge.verifiedFactorId
           : null;
 
-      const auditEntry: AuditEntry = {
-        identityId: identityRow.identityId,
-        actor: cmd.context.actorId,
-        action: 'DETOKENIZE',
-        outcome: 'allow',
-        reason: cmd.context.reason,
-        requestId: cmd.context.requestId ?? null,
-        meta: {
-          challenge_id: challenge.challengeId,
-          token_id: tokenRow.id,
-          actor_role: cmd.context.actorRole,
-          key_version: identityRow.keyVersion,
-          pepper_version: identityRow.pepperVersion,
-          algorithm: tokenRow.algorithm,
-          verified_factor_id: verifiedFactorId,
-          source_ip: cmd.context.sourceIp ?? null,
-          user_agent: cmd.context.userAgent ?? null,
-        },
-      };
+      // Per issue #406, the audit sink is the FLN `logbook`
+      // collection (via `dbStore.addLog`), not a separate
+      // `vault_audit_log` table. The mapping helper shapes
+      // the `LogEntry` and strips any plaintext Aadhaar
+      // defensively, even though no field here ever carries it.
       try {
-        await deps.audit.append(auditEntry);
+        await dbStore.addLog(
+          vaultLogbookEntry(
+            {
+              identityId: identityRow.identityId,
+              actor: cmd.context.actorId,
+              action: 'DETOKENIZE',
+              outcome: 'allow',
+              reason: cmd.context.reason,
+              requestId: cmd.context.requestId ?? null,
+              meta: {
+                challenge_id: challenge.challengeId,
+                token_id: tokenRow.id,
+                actor_role: cmd.context.actorRole,
+                key_version: identityRow.keyVersion,
+                pepper_version: identityRow.pepperVersion,
+                algorithm: tokenRow.algorithm,
+                verified_factor_id: verifiedFactorId,
+                source_ip: cmd.context.sourceIp ?? null,
+                user_agent: cmd.context.userAgent ?? null,
+              },
+            },
+            {
+              userId: cmd.context.userId ?? '',
+              schoolId: cmd.context.schoolId ?? '',
+              schoolName: cmd.context.schoolName ?? '',
+              actorRole: cmd.context.actorRole,
+            },
+            mintVaultLogId(now),
+            now,
+          ),
+        );
       } catch (auditErr) {
         // Same posture as the pre-step-up command: re-throw so
         // the runtime logger can pick it up, but the plaintext

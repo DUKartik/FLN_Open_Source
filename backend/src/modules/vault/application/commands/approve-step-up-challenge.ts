@@ -67,16 +67,20 @@
 import type { KeyManager } from "../ports/key-manager";
 import type { TotpVerifier } from "../ports/totp-verifier";
 import type {
-  AuditEntry,
-  AuditRepository,
   MfaFactor,
   MfaFactorRepository,
   StepUpChallenge,
   StepUpChallengeRepository,
 } from "../ports/repositories";
 import type { EventPublisher } from "../ports/event-publisher";
+import { dbStore } from "../../../../db";
 import { safeZero } from "../../util/dek-zero";
 import { makeMfaSecretContext } from "../util/mfa-secret-context";
+import {
+  mintVaultLogId,
+  vaultLogbookEntry,
+  type VaultAuditInput,
+} from "../../audit/logbook-entry";
 
 // ---------------------------------------------------------------------------
 // Public types — the "approve step-up challenge" contract surface
@@ -101,6 +105,12 @@ export interface ApproveStepUpChallengeCallerContext {
   requestId?: string;
   sourceIp?: string;
   userAgent?: string;
+  /** Denormalised fields the logbook row carries for display /
+   *  filtering. Populated by the route layer from the
+   *  authenticated user; left empty for the SERVICE actor. */
+  userId?: string;
+  schoolId?: string;
+  schoolName?: string;
 }
 
 /**
@@ -206,7 +216,6 @@ export interface ApproveStepUpChallengeDeps {
   totp: TotpVerifier;
   mfa: MfaFactorRepository;
   challenges: StepUpChallengeRepository;
-  audit: AuditRepository;
   events: EventPublisher;
   /**
    * Returns the *current* "now" — injected so tests can pin
@@ -399,12 +408,27 @@ export function makeApproveStepUpChallenge(deps: ApproveStepUpChallengeDeps) {
       //     the canonical row), then publish the success
       //     event.
       // ---------------------------------------------------------
-      // `deps.audit.append` returns the stringified ObjectId
-      // assigned by the underlying store. The challenge
-      // repository persists the link as a string
-      // (`audit_id`).
-      const auditId = await deps.audit.append(
-        buildApproveAuditEntry(cmd, challenge, factor, totpResult.delta, window, now),
+      // Per issue #406, the audit row is the FLN `logbook`
+      // collection's row. The synthetic `vaultlog_...` id
+      // doubles as the challenge row's `audit_id` link, so
+      // an analyst can pivot from the logbook row to the
+      // challenge that approved it. We mint the id BEFORE
+      // writing the row so we know the link value even if
+      // the write fails; the write failure itself surfaces
+      // as the caller's exception.
+      const auditId = mintVaultLogId(now);
+      await dbStore.addLog(
+        vaultLogbookEntry(
+          buildApproveAuditEntry(cmd, challenge, factor, totpResult.delta, window, now),
+          {
+            userId: cmd.context.userId ?? '',
+            schoolId: cmd.context.schoolId ?? '',
+            schoolName: cmd.context.schoolName ?? '',
+            actorRole: cmd.context.actorRole,
+          },
+          auditId,
+          now,
+        ),
       );
 
       const approved = await deps.challenges.approve({
@@ -418,21 +442,33 @@ export function makeApproveStepUpChallenge(deps: ApproveStepUpChallengeDeps) {
         // The repository rejected the transition. This
         // means the row was no longer `pending` when
         // approve ran.
-        await deps.audit.append({
-          identityId: challenge.identityId,
-          actor: cmd.context.actorId,
-          action: "STEP_UP_APPROVE",
-          outcome: "deny",
-          reason: cmd.context.reason,
-          requestId: cmd.context.requestId ?? null,
-          meta: {
-            challenge_id: challenge.challengeId,
-            factor_id: factor.factorId,
-            failure_reason: "CONCURRENT_TRANSITION",
-            source_ip: cmd.context.sourceIp ?? null,
-            user_agent: cmd.context.userAgent ?? null,
-          },
-        });
+        await dbStore.addLog(
+          vaultLogbookEntry(
+            {
+              identityId: challenge.identityId,
+              actor: cmd.context.actorId,
+              action: "STEP_UP_APPROVE",
+              outcome: "deny",
+              reason: cmd.context.reason,
+              requestId: cmd.context.requestId ?? null,
+              meta: {
+                challenge_id: challenge.challengeId,
+                factor_id: factor.factorId,
+                failure_reason: "CONCURRENT_TRANSITION",
+                source_ip: cmd.context.sourceIp ?? null,
+                user_agent: cmd.context.userAgent ?? null,
+              },
+            },
+            {
+              userId: cmd.context.userId ?? '',
+              schoolId: cmd.context.schoolId ?? '',
+              schoolName: cmd.context.schoolName ?? '',
+              actorRole: cmd.context.actorRole,
+            },
+            mintVaultLogId(now),
+            now,
+          ),
+        );
         throw new ApproveStepUpChallengeCommandError(
           "CHALLENGE_NOT_PENDING",
           "Step-up challenge was concurrently transitioned out of pending.",
@@ -485,7 +521,7 @@ function buildApproveAuditEntry(
   delta: number,
   window: number,
   now: Date,
-): AuditEntry {
+): VaultAuditInput {
   return {
     identityId: challenge.identityId,
     actor: cmd.context.actorId,
@@ -522,25 +558,36 @@ async function recordFailure(
   reason: "CODE_MISMATCH",
   now: Date,
 ): Promise<void> {
-  const auditEntry: AuditEntry = {
-    identityId: challenge.identityId,
-    actor: cmd.context.actorId,
-    action: "STEP_UP_APPROVE",
-    outcome: "deny",
-    reason: cmd.context.reason,
-    requestId: cmd.context.requestId ?? null,
-    meta: {
-      challenge_id: challenge.challengeId,
-      operation: challenge.operation,
-      token_id: challenge.tokenId,
-      factor_id: factor.factorId,
-      factor_actor: factor.actor,
-      failure_reason: reason,
-      source_ip: cmd.context.sourceIp ?? null,
-      user_agent: cmd.context.userAgent ?? null,
-    },
-  };
-  await deps.audit.append(auditEntry);
+  await dbStore.addLog(
+    vaultLogbookEntry(
+      {
+        identityId: challenge.identityId,
+        actor: cmd.context.actorId,
+        action: "STEP_UP_APPROVE",
+        outcome: "deny",
+        reason: cmd.context.reason,
+        requestId: cmd.context.requestId ?? null,
+        meta: {
+          challenge_id: challenge.challengeId,
+          operation: challenge.operation,
+          token_id: challenge.tokenId,
+          factor_id: factor.factorId,
+          factor_actor: factor.actor,
+          failure_reason: reason,
+          source_ip: cmd.context.sourceIp ?? null,
+          user_agent: cmd.context.userAgent ?? null,
+        },
+      },
+      {
+        userId: cmd.context.userId ?? '',
+        schoolId: cmd.context.schoolId ?? '',
+        schoolName: cmd.context.schoolName ?? '',
+        actorRole: cmd.context.actorRole,
+      },
+      mintVaultLogId(now),
+      now,
+    ),
+  );
 
   await deps.events.publish({
     type: "StepUpChallengeFailed",

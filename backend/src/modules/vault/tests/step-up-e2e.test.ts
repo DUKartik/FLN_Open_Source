@@ -60,6 +60,7 @@ import { makeEnrollMfa } from '../application/commands/enroll-mfa';
 import { makeRequestDetokenization } from '../application/commands/request-detokenization';
 import { makeApproveStepUpChallenge } from '../application/commands/approve-step-up-challenge';
 import { makeDetokenizeAadhaar } from '../application/commands/detokenize-aadhaar';
+import { dbStore, type LogEntry } from '../../../db';
 import type {
   IdentityRecord,
   IdentityRepository,
@@ -69,11 +70,6 @@ import type {
   NewToken,
   TokenRepository,
   TokenRow,
-} from '../application/ports/repositories';
-import type {
-  AuditEntry,
-  AuditRecord,
-  AuditRepository,
 } from '../application/ports/repositories';
 import type {
   ApproveStepUpChallengeInput,
@@ -131,17 +127,29 @@ class InMemoryTokenRepository implements TokenRepository {
   }
 }
 
-class InMemoryAuditRepository implements AuditRepository {
-  private readonly rows: AuditRecord[] = [];
-  private counter = 0;
-  async append(entry: AuditEntry): Promise<string> {
-    this.counter += 1;
-    const auditId = `audit-${this.counter}`;
-    this.rows.push({ ...entry, auditId, occurredAt: new Date() });
-    return auditId;
+/**
+ * In-memory logbook sink — captures the `LogEntry` rows that
+ * the transactional `writeLog` path emits (the non-
+ * transactional commands write to the real `dbStore`, which
+ * this test reads via `getLogbook()`).
+ *
+ * Mirrors the production `MongoTransactionalVaultWriter.writeLog`
+ * seam: it takes a `LogEntry` and stores it. The test can
+ * later assert on the captured rows to verify the audit
+ * chain survived the end-to-end flow.
+ */
+class InMemoryLogbookSink {
+  private readonly rows: LogEntry[] = [];
+  async writeLog(entry: LogEntry): Promise<void> {
+    // Defensive copy so the test cannot accidentally mutate a
+    // captured row by holding a reference to it.
+    this.rows.push({ ...entry });
   }
-  async listByIdentity(identityId: string): Promise<AuditRecord[]> {
-    return this.rows.filter(r => r.identityId === identityId);
+  list(): readonly LogEntry[] {
+    return this.rows;
+  }
+  reset(): void {
+    this.rows.length = 0;
   }
 }
 
@@ -257,18 +265,25 @@ class InMemoryMfaFactorRepository implements MfaFactorRepository {
  * Mongo writer wraps three writes in a `withTransaction` block, but
  * here the in-memory repos are themselves atomic so the wrapper is a
  * pass-through).
+ *
+ * Per issue #406, the audit row inside the transactional scope
+ * is a `LogEntry` (not a vault-internal `AuditEntry`). The
+ * `writeLog` method hands it to the in-memory sink so the test
+ * can assert the row was written with the right shape; the
+ * production writer hands it to the FLN `logbook` collection
+ * inside the same Mongo session.
  */
 class InProcessVaultWriter implements TransactionalVaultWriter {
   constructor(
     private readonly identities: InMemoryIdentityRepository,
     private readonly tokens: InMemoryTokenRepository,
-    private readonly audit: InMemoryAuditRepository,
+    private readonly logbook: InMemoryLogbookSink,
   ) {}
   async runWrite<T>(work: (conn: VaultWriteConnection) => Promise<T>): Promise<T> {
     const conn: VaultWriteConnection = {
       insertIdentity: async rec => { await this.identities.insert(rec); },
       insertToken: async token => this.tokens.insert(token),
-      appendAudit: async entry => { await this.audit.append(entry); },
+      writeLog: async entry => { await this.logbook.writeLog(entry); },
     };
     return work(conn);
   }
@@ -283,7 +298,7 @@ let cryptoSvc: NodeCryptoService;
 let totp: OtpAuthTotpVerifier;
 let identities: InMemoryIdentityRepository;
 let tokens: InMemoryTokenRepository;
-let audit: InMemoryAuditRepository;
+let logbook: InMemoryLogbookSink;
 let challenges: InMemoryStepUpChallengeRepository;
 let mfa: InMemoryMfaFactorRepository;
 let vaultWriter: InProcessVaultWriter;
@@ -294,7 +309,25 @@ let requestDetokenization: ReturnType<typeof makeRequestDetokenization>;
 let approveStepUpChallenge: ReturnType<typeof makeApproveStepUpChallenge>;
 let detokenizeAadhaar: ReturnType<typeof makeDetokenizeAadhaar>;
 
-before(() => {
+before(async () => {
+  // dbStore.init() is normally called from backend/src/index.ts
+  // (the server entry point). Tests bypass that path, so we
+  // must initialize the singleton explicitly — without it the
+  // `data` array is null and addLog() is a silent no-op (the
+  // file-fallback path checks `if (this.data)` before pushing).
+  // In test env (no MONGO_URL), init() loads the seed JSON
+  // and points the in-memory `data` at it.
+  await dbStore.init();
+
+  // Clear the logbook so assertions count only the rows this
+  // test run wrote. init() above loads the seed logbook
+  // (or whatever persisted in `db.json` from a prior run);
+  // without this reset the assertions on `actions` would
+  // include leftover rows from earlier runs.
+  // We need a clean slate, not a snapshot of state at boot.
+  const anyStore = dbStore as unknown as { data: { logbook: any[] } | null };
+  if (anyStore.data) anyStore.data.logbook = [];
+
   keyManager = new LocalDevKeyManager({
     keyVersion: 'kv-1',
     masterKey: Buffer.from(process.env.LOCAL_DEV_MASTER_KEY!, 'base64'),
@@ -304,22 +337,28 @@ before(() => {
   totp = new OtpAuthTotpVerifier();
   identities = new InMemoryIdentityRepository();
   tokens = new InMemoryTokenRepository();
-  audit = new InMemoryAuditRepository();
+  logbook = new InMemoryLogbookSink();
   challenges = new InMemoryStepUpChallengeRepository();
   mfa = new InMemoryMfaFactorRepository();
-  vaultWriter = new InProcessVaultWriter(identities, tokens, audit);
+  vaultWriter = new InProcessVaultWriter(identities, tokens, logbook);
   events = new InProcessEventPublisher();
 
+  // Per issue #406, the audit chain is the FLN `logbook`
+  // collection, written by the commands via `dbStore.addLog`
+  // (or the transactional `writeLog` seam, captured by
+  // `InMemoryLogbookSink`). The command factories no longer
+  // take an `audit` dependency; the dep is wired through the
+  // `dbStore` singleton.
   tokenize = makeTokenizeAadhaar({ keyManager, crypto: cryptoSvc, vaultWriter, events });
-  enrollMfa = makeEnrollMfa({ keyManager, totp, mfa, audit, events });
+  enrollMfa = makeEnrollMfa({ keyManager, totp, mfa, events });
   requestDetokenization = makeRequestDetokenization({
-    tokens, identities, mfa, challenges, audit, events,
+    tokens, identities, mfa, challenges, events,
   });
   approveStepUpChallenge = makeApproveStepUpChallenge({
-    keyManager, totp, mfa, challenges, audit, events,
+    keyManager, totp, mfa, challenges, events,
   });
   detokenizeAadhaar = makeDetokenizeAadhaar({
-    keyManager, crypto: cryptoSvc, tokens, identities, audit, events, challenges,
+    keyManager, crypto: cryptoSvc, tokens, identities, events, challenges,
   });
 });
 
@@ -432,6 +471,54 @@ test('E2E Step-Up: tokenize → enrollMfa → request → approve → detokenize
   const afterConsume = await challenges.findById(req.challengeId);
   assert.ok(afterConsume);
   assert.equal(afterConsume.status, 'consumed');
+
+  // ── Audit chain assertions (issue #406) ──────────────────────────
+  // The tokenize path is transactional; its audit row lives in
+  // the in-memory sink. The other 4 rows (enroll / request /
+  // approve / detokenize) flow through `dbStore.addLog` and
+  // land in the FLN `logbook` collection (here, the
+  // file-fallback `data.logbook` array). All 5 rows must
+  // exist with the right `action`, `actor`, and a parseable
+  // `details` prefix.
+  const txRows = logbook.list();
+  assert.equal(txRows.length, 1, 'tokenize should write exactly 1 audit row to the transactional sink');
+  const tokenizeRow = txRows[0]!;
+  assert.equal(tokenizeRow.activityType, 'tokenize');
+  assert.equal(tokenizeRow.userEmail, 'fln-backend-service');
+  assert.equal(tokenizeRow.status, 'Success');
+  assert.ok(tokenizeRow.details.startsWith('vault: tokenize '), `details must start with vault: tokenize, got: ${tokenizeRow.details.slice(0, 60)}`);
+  assert.ok(tokenizeRow.details.includes(`identity=${tok.identityId}`), 'tokenize row must reference the identityId');
+
+  // The non-transactional rows go through the real `dbStore`.
+  // Read via `listLogsByDetailsPrefix` (the same helper the
+  // read-audit-history command uses) and assert the row shape.
+  const logbookRows = await dbStore.listLogsByDetailsPrefix('vault:', { limit: 100 });
+  // The 4 non-transactional commands (mfa_enroll, step_up_request,
+  // step_up_approve, detokenize) write via `dbStore.addLog`. The
+  // tokenize row is in `txRows` above (the transactional sink
+  // that carries the in-process session — in production this
+  // is the Mongo replica-set session; in this test it's the
+  // InMemoryLogbookSink). The two sinks are intentionally
+  // distinct because tokenize needs identity+token+audit
+  // atomicity that the other commands don't.
+  const actions = logbookRows.map(r => r.activityType).sort();
+  assert.deepEqual(actions, ['detokenize', 'mfa_enroll', 'step_up_approve', 'step_up_request'],
+    `expected 4 non-tokenize vault actions in dbStore, got: ${actions.join(',')}`);
+  // None of the rows may contain a 12-digit Aadhaar in the
+  // details — that's security rule 9.
+  for (const row of logbookRows) {
+    assert.ok(!/\b\d{12}\b/.test(row.details), `logbook row details must not contain a 12-digit Aadhaar: ${row.details.slice(0, 80)}`);
+  }
+
+  // The challenge row's auditId must resolve to the
+  // step_up_approve logbook row (the row minted in
+  // `approveStepUpChallenge` and stamped onto the challenge).
+  // Pivoting from the challenge row to the logbook via that id
+  // is the read-audit-history command's correlation contract.
+  const approveRow = logbookRows.find(r => r.id === afterConsume.auditId);
+  assert.ok(approveRow, `challenge.auditId ${afterConsume.auditId} must resolve to a logbook row`);
+  assert.equal(approveRow!.activityType, 'step_up_approve',
+    `challenge.auditId must point at the step_up_approve logbook row, got activityType=${approveRow!.activityType}`);
 });
 
 test('E2E Step-Up: wrong TOTP code surfaces CODE_MISMATCH and leaves the challenge pending', async () => {

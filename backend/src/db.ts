@@ -1,7 +1,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import bcrypt from 'bcrypt';
-import { MongoClient, Db } from 'mongodb';
+import { MongoClient, Db, ClientSession } from 'mongodb';
 import { CURRICULUM_MAPPING } from './config/curriculumMap';
 
 const DB_DIR = path.resolve(process.cwd(), 'data');
@@ -513,7 +513,27 @@ export interface LogEntry {
   userId: string;
   userEmail: string;
   userRole: UserRole;
-  activityType: 'download' | 'print' | 'conduct' | 'scan' | 'verify' | 'ticket';
+  activityType:
+    | 'download'
+    | 'print'
+    | 'conduct'
+    | 'scan'
+    | 'verify'
+    | 'ticket'
+    // Vault audit actions (the vault is the only writer of these
+    // — see backend/src/modules/vault/audit/logbook-entry.ts). The
+    // `logbook` collection is the single audit sink; there is no
+    // separate `vault_audit_log` table. The Aadhaar vault command
+    // and the surrounding route layer use the existing
+    // `dbStore.addLog` / `dbStore.addLogInSession` path, so these
+    // values are visible in the same `logbook` queries the rest
+    // of the FLN backend already runs.
+    | 'tokenize'
+    | 'detokenize'
+    | 'step_up_request'
+    | 'step_up_approve'
+    | 'mfa_enroll'
+    | 'mfa_verify';
   status: 'Success' | 'Failed' | 'Delayed';
   details: string;
 }
@@ -1844,6 +1864,91 @@ export class DBStore {
       if (!this.mongoDb) await this.save();
     }
     return log;
+  }
+
+  /**
+   * Transactional sibling of {@link addLog}. Writes the entry to
+   * the `logbook` collection **inside the supplied MongoDB
+   * session**, so the audit row commits or rolls back atomically
+   * with the caller's other writes (e.g. the `vault_identities`
+   * and `vault_tokens` inserts in the tokenize command).
+   *
+   * **Why this exists.** Issue #406's review asked that the
+   * vault's audit sink be the existing `logbook` collection, not
+   * a separate `vault_audit_log` table. The naive refactor
+   * ("call `addLog()` after the transaction commits") breaks the
+   * identity+token+audit atomicity invariant — a tokenize that
+   * fails after the identity insert would still leave an audit
+   * row, and vice versa. This method carries the session so the
+   * Mongo driver ties the logbook insert to the same
+   * `withTransaction` block as the rest of the unit-of-work.
+   *
+   * **File-fallback path.** The `data.logbook` array is also
+   * updated best-effort. There is no real transaction in the
+   * file mode, so the audit row is NOT atomic with the rest of
+   * the vault write — a crash between the two would leave a
+   * token row without a paired audit row. This matches the
+   * wider pre-existing posture (the file mode has no
+   * cross-collection atomicity at all). Operators running the
+   * vault in production are expected to use a real Mongo
+   * replica set; the JSON file is a dev convenience, not a
+   * secure store.
+   */
+  async addLogInSession(session: ClientSession, log: LogEntry): Promise<LogEntry> {
+    if (this.mongoDb) {
+      await this.mongoDb.collection('logbook').insertOne(log, { session });
+    }
+    if (this.data) {
+      this.data.logbook.unshift(log);
+      if (!this.mongoDb) await this.save();
+    }
+    return log;
+  }
+
+  /**
+   * Read-side counterpart of {@link addLog}. Returns logbook rows
+   * whose `details` field starts with the given prefix, sorted
+   * newest-first, capped at `opts.limit` (default 100, max 1000).
+   *
+   * Used by the vault's read-audit-history command to filter
+   * the `logbook` collection down to vault audit rows (the
+   * `details` prefix is `vault:`, set by the mapping helper at
+   * `backend/src/modules/vault/audit/logbook-entry.ts`).
+   *
+   * The query is a prefix match, not an exact match: the
+   * `details` string is `vault:<action> identity=<id> ...`, so
+   * the same `vault:` prefix covers every vault row regardless
+   * of action. Callers that need to filter further (e.g. by
+   * identityId) do so in application code, parsing the `details`
+   * field — see `parseVaultLogbookEntry` in the audit-log
+   * helper.
+   *
+   * Regex special characters in the prefix are escaped so a
+   * caller passing arbitrary text cannot inject a regex
+   * pattern. The file-fallback path does a plain
+   * `String.prototype.startsWith` check.
+   */
+  async listLogsByDetailsPrefix(
+    prefix: string,
+    opts: { limit?: number } = {},
+  ): Promise<LogEntry[]> {
+    const limit = Math.max(1, Math.min(opts.limit ?? 100, 1000));
+    if (this.mongoDb) {
+      const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return await this.mongoDb
+        .collection<LogEntry>('logbook')
+        .find({ details: { $regex: '^' + escaped } })
+        .sort({ timestamp: -1 })
+        .limit(limit)
+        .toArray();
+    }
+    const rows = (this.data?.logbook ?? []).filter((l) =>
+      typeof l.details === 'string' && l.details.startsWith(prefix),
+    );
+    rows.sort((a, b) =>
+      a.timestamp < b.timestamp ? 1 : a.timestamp > b.timestamp ? -1 : 0,
+    );
+    return rows.slice(0, limit);
   }
 
   async addAnnouncement(ann: Announcement) {
