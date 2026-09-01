@@ -130,6 +130,16 @@ registerStatsRoutes(app);
   // Admin Step-Up detokenization (Aadhaar Vault — see aadhaarDetokenize.ts).
   registerAadhaarDetokenizeRoutes(app);
 
+  // In-process vault module (Phase 1 stub). Off by default; opt in via
+  // VAULT_MODULE_ENABLED=true. Progressive feature flag — the module's
+  // route surface grows across Phases 2-5; the flag is dropped in Phase 7
+  // once every path is wired. Dynamic import keeps the default dev path
+  // lightweight (no vault code is parsed unless the flag is on).
+  if (process.env.VAULT_MODULE_ENABLED === 'true') {
+    const { registerVaultRoutes } = await import('./modules/vault');
+    registerVaultRoutes(app);
+  }
+
   registerEvaluationRoutes(app);
   registerWorksheetRoutes(app);
   registerAnalyticsRoutes(app);
