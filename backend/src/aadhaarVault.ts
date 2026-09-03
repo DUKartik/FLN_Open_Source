@@ -310,12 +310,22 @@ export async function detokenizeAadhaar(
  * material stays server-side; this envelope is for admin self-service UI
  * only. `lastUsedAt` / `expiresAt` are ISO strings when present, `null`
  * otherwise. `createdAt` is always an ISO string.
+ *
+ * `lifecycleState` and `verifyAttempts` are REQUIRED on the wire —
+ * the Security panel and the Aadhaar reveal dialog both branch on
+ * `lifecycleState` to decide whether to render the Pending/Enrolled
+ * state or the "Authenticator required" handoff to the Security
+ * panel. Omitting these fields (the pre-fix shape) made every
+ * just-verified factor look like "not enrolled" to the UI, which
+ * in turn made the Security panel's "Set up authenticator" button
+ * fire a POST /api/me/mfa/enroll that returned 409 ALREADY_ENROLLED.
  */
 export type MfaFactorMeta = {
   factorId: string;
   actor: string;
   factorType: 'totp' | string;
   status: 'active' | 'revoked' | string;
+  lifecycleState: 'PENDING_ENROLLMENT' | 'ENROLLED';
   label: string | null;
   algorithm: 'SHA1' | 'SHA256' | 'SHA512' | string;
   digits: number;
@@ -323,6 +333,7 @@ export type MfaFactorMeta = {
   lastUsedAt: string | null;
   expiresAt: string | null;
   createdAt: string;
+  verifyAttempts: number;
 };
 
 export type ListMfaFactorsParams = {
@@ -356,4 +367,135 @@ export async function listMfaFactors(
   params: ListMfaFactorsParams,
 ): Promise<ListMfaFactorsResult> {
   return listMfaFactorsImpl(params);
+}
+
+// ---------------------------------------------------------------------------
+// VerifyMfa shim (Wave 2A)
+// ---------------------------------------------------------------------------
+//
+// Wraps the vault command's verifyMfa use case for the FLN
+// /api/me/mfa/verify route. Same swappable-impl pattern as the
+// other shims above: the default impl throws NOT_CONFIGURED
+// until `__setVerifyMfaFactorImpl` is wired by
+// `backend/src/modules/vault/context.ts`. The wire shape mirrors
+// the existing AadhaarActorContext so the route handler doesn't
+// have to translate between two context shapes.
+//
+// Result shape: a flattened envelope that hides the underlying
+// `VerifyMfaResult` discriminated union. The route maps the
+// failure `reason` to an HTTP status; the success shape is the
+// factor id + lifecycle state the UI needs to transition from
+// the "Pending" to the "Enrolled" render state.
+
+const NOT_CONFIGURED_VERIFY: VaultError = new VaultError(
+  'NOT_CONFIGURED',
+  500,
+  'Aadhaar vault module is not wired. backend/src/index.ts must import '
+    + 'backend/src/modules/vault and call registerVaultRoutes(app) at boot. '
+    + 'This call cannot proceed safely until that is fixed.',
+);
+
+export type VerifyMfaFactorParams = {
+  factorId: string;
+  code: string;
+  /** JWT subject — the actor who owns this factor. The command
+   *  refuses to verify a factor whose `actor` does not match
+   *  (the cross-admin attack guard). */
+  actor: string;
+  context: {
+    actorId: string;
+    actorRole: 'TEACHER' | 'SCHOOL_ADMIN' | 'STATE_ADMIN' | 'SUPER_ADMIN' | 'SERVICE';
+    reason: string;
+    requestId?: string;
+  };
+};
+
+export type VerifyMfaFactorResult =
+  | {
+      valid: true;
+      factorId: string;
+      lifecycleState: 'PENDING_ENROLLMENT' | 'ENROLLED';
+      delta?: number;
+    }
+  | {
+      valid: false;
+      factorId: string | null;
+      reason:
+        | 'FACTOR_NOT_FOUND'
+        | 'FACTOR_REVOKED'
+        | 'FACTOR_EXPIRED'
+        | 'ACTOR_MISMATCH'
+        | 'CODE_MISMATCH'
+        | 'ALREADY_ENROLLED';
+    };
+
+export type VerifyMfaFactorFn = (params: VerifyMfaFactorParams) => Promise<VerifyMfaFactorResult>;
+
+let verifyMfaFactorImpl: VerifyMfaFactorFn = async () => { throw NOT_CONFIGURED_VERIFY; };
+const verifyMfaFactorImplDefault = verifyMfaFactorImpl;
+
+export function __setVerifyMfaImpl(fn: VerifyMfaFactorFn | null): void {
+  verifyMfaFactorImpl = fn === null ? verifyMfaFactorImplDefault : fn;
+}
+
+/**
+ * Verify a 6-8 digit TOTP code against the caller's factor. The
+ * command flips a PENDING_ENROLLMENT factor to ENROLLED on first
+ * success and returns the post-transition lifecycle state so the
+ * route can distinguish first-verify (200, lifecycleState=ENROLLED)
+ * from re-verify (409, ALREADY_ENROLLED).
+ */
+export async function verifyMfaFactor(
+  params: VerifyMfaFactorParams,
+): Promise<VerifyMfaFactorResult> {
+  return verifyMfaFactorImpl(params);
+}
+
+// ---------------------------------------------------------------------------
+// RevokeMfa shim (Wave 2A)
+// ---------------------------------------------------------------------------
+//
+// Wraps the vault repository's `mfa.revoke(factorId)` for the FLN
+// DELETE /api/me/mfa/factors/:factorId route. Same swappable-impl
+// pattern as the other shims; default impl throws NOT_CONFIGURED
+// until `__setRevokeMfaImpl` is wired in
+// `backend/src/modules/vault/context.ts`. The route performs
+// actor-isolation BEFORE calling this shim, so the shim itself
+// does not authorize — it just delegates to the in-process
+// repository and returns the updated row.
+
+const NOT_CONFIGURED_REVOKE: VaultError = new VaultError(
+  'NOT_CONFIGURED',
+  500,
+  'Aadhaar vault module is not wired. backend/src/index.ts must import '
+    + 'backend/src/modules/vault and call registerVaultRoutes(app) at boot. '
+    + 'This call cannot proceed safely until that is fixed.',
+);
+
+export type RevokeMfaParams = {
+  factorId: string;
+};
+
+export type RevokeMfaResult = {
+  factorId: string;
+  status: 'revoked';
+};
+
+export type RevokeMfaFn = (params: RevokeMfaParams) => Promise<RevokeMfaResult>;
+
+let revokeMfaImpl: RevokeMfaFn = async () => { throw NOT_CONFIGURED_REVOKE; };
+const revokeMfaImplDefault = revokeMfaImpl;
+
+export function __setRevokeMfaImpl(fn: RevokeMfaFn | null): void {
+  revokeMfaImpl = fn === null ? revokeMfaImplDefault : fn;
+}
+
+/**
+ * Revoke a TOTP factor. Idempotent — revoking an already-
+ * revoked row is a no-op that still returns the row.
+ */
+export async function revokeMfaFactor(
+  params: RevokeMfaParams,
+): Promise<RevokeMfaResult> {
+  return revokeMfaImpl(params);
 }

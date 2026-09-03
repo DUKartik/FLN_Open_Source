@@ -221,6 +221,7 @@ class InMemoryMfaFactorRepository implements MfaFactorRepository {
       actor: rec.actor,
       factorType: 'totp',
       status: 'active',
+      lifecycleState: rec.lifecycleState,
       label: rec.label,
       encryptedSecret: rec.encryptedSecret,
       algorithm: rec.algorithm,
@@ -229,6 +230,7 @@ class InMemoryMfaFactorRepository implements MfaFactorRepository {
       lastUsedAt: null,
       expiresAt: rec.expiresAt ?? null,
       createdAt: new Date(),
+      verifyAttempts: rec.verifyAttempts,
     };
     this.byId.set(rec.factorId, row);
     return row;
@@ -254,7 +256,30 @@ class InMemoryMfaFactorRepository implements MfaFactorRepository {
     return Array.from(this.byId.values()).filter(f => f.actor === actor);
   }
   async listActiveByActor(actor: string): Promise<MfaFactor[]> {
-    return (await this.listByActor(actor)).filter(f => f.status === 'active');
+    return (await this.listByActor(actor)).filter(
+      f => f.status === 'active' && f.lifecycleState === 'ENROLLED',
+    );
+  }
+  async findActivePendingByActor(actor: string): Promise<MfaFactor[]> {
+    return (await this.listByActor(actor)).filter(
+      f => f.status === 'active' && f.lifecycleState === 'PENDING_ENROLLMENT',
+    );
+  }
+  async transitionToEnrolled(factorId: string): Promise<MfaFactor | null> {
+    const cur = this.byId.get(factorId);
+    if (!cur) return null;
+    if (cur.status !== 'active' || cur.lifecycleState !== 'PENDING_ENROLLMENT') {
+      return null;
+    }
+    const next: MfaFactor = { ...cur, lifecycleState: 'ENROLLED' };
+    this.byId.set(factorId, next);
+    return next;
+  }
+  async incrementVerifyAttempts(factorId: string): Promise<void> {
+    const cur = this.byId.get(factorId);
+    if (!cur) return;
+    const next: MfaFactor = { ...cur, verifyAttempts: cur.verifyAttempts + 1 };
+    this.byId.set(factorId, next);
   }
 }
 

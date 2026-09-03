@@ -52,8 +52,13 @@ const DEFAULT_ALGORITHM: TotpAlgorithm = "SHA1";
 // 8 digits (matching Authy / Microsoft Authenticator's "advanced"
 // mode) gives ~10^8 = 100M codes per step — a brute-force attempt
 // within a 90s window has effectively zero chance of collision even
-// without rate-limiting, and a human can still type the code in a few
-// seconds.
+// without rate-limiting, and a human can still type the code in a
+// few seconds. The verify commands
+// (`verify-mfa.ts`, `approve-step-up-challenge.ts`) accept BOTH
+// 6- and 8-digit codes at the pre-check, so 6-digit factors minted
+// during a previous 6-digit default are still valid. The verifier
+// reads `meta.digits` per-factor at `buildTotpForVerify` time so
+// the validation itself uses whatever digit count the row says.
 const DEFAULT_DIGITS = 8;
 const DEFAULT_PERIOD = 30;
 

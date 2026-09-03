@@ -533,7 +533,16 @@ export interface LogEntry {
     | 'step_up_request'
     | 'step_up_approve'
     | 'mfa_enroll'
-    | 'mfa_verify';
+    | 'mfa_verify'
+    // NEW (Wave 2A): account-level MFA enrollment lifecycle
+    // events. The vault command and the FLN route layer both
+    // write rows that carry these activityType values. The
+    // mapping lives in
+    // `backend/src/modules/vault/audit/logbook-entry.ts`.
+    | 'mfa_enrollment_initiated'
+    | 'mfa_enrollment_verified'
+    | 'mfa_enrollment_failed'
+    | 'mfa_enrollment_revoked';
   status: 'Success' | 'Failed' | 'Delayed';
   details: string;
 }

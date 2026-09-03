@@ -179,11 +179,14 @@ export type MfaFactorType = "totp";
 
 export type MfaFactorStatus = "active" | "revoked";
 
+export type MfaFactorLifecycleState = "PENDING_ENROLLMENT" | "ENROLLED";
+
 export interface MfaFactor {
   factorId: string;
   actor: string;
   factorType: MfaFactorType;
   status: MfaFactorStatus;
+  lifecycleState: MfaFactorLifecycleState;  // NEW: enrollment lifecycle, orthogonal to status
   label: string;
   /** AES-GCM envelope of the TOTP shared secret. Persisted as the
    *  output of KeyManager.sealSecret. */
@@ -194,12 +197,15 @@ export interface MfaFactor {
   lastUsedAt: Date | null;
   expiresAt: Date | null;
   createdAt: Date;
+  verifyAttempts: number;  // NEW: monotonic counter of verifyMfaFactor calls (success + failure)
 }
 
 export interface InsertMfaFactorInput {
   factorId: string;
   actor: string;
   factorType: MfaFactorType;
+  lifecycleState: MfaFactorLifecycleState;  // NEW: defaults to PENDING_ENROLLMENT at insert
+  verifyAttempts: number;                    // NEW: defaults to 0 at insert
   label: string;
   encryptedSecret: Buffer;
   algorithm: string;
@@ -235,4 +241,18 @@ export interface MfaFactorRepository {
 
   /** Active (non-revoked) factors only. The detokenize hot path. */
   listActiveByActor(actor: string): Promise<MfaFactor[]>;
+
+  /** Active (non-revoked) factors that are still PENDING_ENROLLMENT — used by
+   *  POST /api/me/mfa/enroll to detect a resumable enrollment and return the
+   *  same factorId+otpauthUri without minting a new secret. */
+  findActivePendingByActor(actor: string): Promise<MfaFactor[]>;
+
+  /** Atomic CAS: PENDING_ENROLLMENT -> ENROLLED. Returns the updated row, or
+   *  null if the factor doesn't exist OR is already ENROLLED. The route
+   *  uses the null return to distinguish "first verify" from "re-verify". */
+  transitionToEnrolled(factorId: string): Promise<MfaFactor | null>;
+
+  /** Atomic $inc of verifyAttempts. Called once per verifyMfaFactor attempt
+   *  (success or failure) so the counter reflects all attempts. */
+  incrementVerifyAttempts(factorId: string): Promise<void>;
 }

@@ -272,6 +272,8 @@ export function makeEnrollMfa(deps: EnrollMfaDeps) {
         factorId,
         actor: cmd.actor,
         factorType: "totp",
+        lifecycleState: "PENDING_ENROLLMENT",  // NEW
+        verifyAttempts: 0,                       // NEW
         label,
         encryptedSecret: wrapped.bytes,
         algorithm: effectiveAlgorithm,
@@ -312,6 +314,7 @@ export function makeEnrollMfa(deps: EnrollMfaDeps) {
                 factor_id: factorId,
                 factor_type: "totp",
                 factor_actor: cmd.actor,
+                lifecycle_state: 'PENDING_ENROLLMENT',  // NEW
                 label,
                 algorithm: effectiveAlgorithm,
                 digits: effectiveDigits,

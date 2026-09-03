@@ -211,6 +211,19 @@ function mapActionToActivityType(
       return 'mfa_enroll';
     case 'MFA_VERIFY':
       return 'mfa_verify';
+    // NEW (Wave 2A): account-level enrollment lifecycle rows.
+    // Each row is the FLN route's counterpart to the vault
+    // command's row — the two are siblings, not replacements.
+    // The `activityType` union in `db.ts` already carries
+    // these 4 string literals, so the mapping is 1:1.
+    case 'MFA_ENROLLMENT_INITIATED':
+      return 'mfa_enrollment_initiated';
+    case 'MFA_ENROLLMENT_VERIFIED':
+      return 'mfa_enrollment_verified';
+    case 'MFA_ENROLLMENT_FAILED':
+      return 'mfa_enrollment_failed';
+    case 'MFA_ENROLLMENT_REVOKED':
+      return 'mfa_enrollment_revoked';
     default:
       // Unknown vault action — fall through to a generic
       // tokenize so the union type is satisfied. The `details`

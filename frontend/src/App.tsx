@@ -297,7 +297,7 @@ export default function App() {
 
                 {!['workspace', 'logbook', 'tickets', 'calendar', 'settings', 'notifications', 'misconceptions'].includes(activePanel) && (
                   <ErrorBoundary label={activePanel}>
-                    <PanelViews activePanel={activePanel} currentUser={currentUser} token={token} />
+                    <PanelViews activePanel={activePanel} currentUser={currentUser} token={token} onSelectView={setActivePanel} />
                   </ErrorBoundary>
                 )}
 

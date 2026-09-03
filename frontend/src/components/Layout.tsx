@@ -188,6 +188,7 @@ export const Layout: React.FC<LayoutProps> = ({
         list.push({ name: 'Performance', view: 'performance', icon: BarChart3 });
         list.push({ name: 'Analytics', view: 'analytics', icon: BarChart3 });
         list.push({ name: 'Aadhaar Reveal', view: 'aadhaar_reveal', icon: ShieldCheck });
+        list.push({ name: 'Security', view: 'security', icon: KeyRound });
         break;
 
       case UserRole.DISTRICT_ADMIN:
@@ -195,12 +196,14 @@ export const Layout: React.FC<LayoutProps> = ({
         list.push({ name: 'Schools', view: 'schools', icon: School });
         list.push({ name: 'Analytics', view: 'analytics', icon: BarChart3 });
         list.push({ name: 'Aadhaar Reveal', view: 'aadhaar_reveal', icon: ShieldCheck });
+        list.push({ name: 'Security', view: 'security', icon: KeyRound });
         break;
 
       case UserRole.ADMIN:
         list.push({ name: 'Districts', view: 'districts', icon: MapPin });
         list.push({ name: 'Analytics', view: 'analytics', icon: BarChart3 });
         list.push({ name: 'Aadhaar Reveal', view: 'aadhaar_reveal', icon: ShieldCheck });
+        list.push({ name: 'Security', view: 'security', icon: KeyRound });
         break;
 
       case UserRole.SUPERADMIN:
@@ -211,6 +214,7 @@ export const Layout: React.FC<LayoutProps> = ({
         list.push({ name: 'Analytics', view: 'analytics', icon: BarChart3 });
         list.push({ name: 'System Settings', view: 'system_settings', icon: Settings });
         list.push({ name: 'Aadhaar Reveal', view: 'aadhaar_reveal', icon: ShieldCheck });
+        list.push({ name: 'Security', view: 'security', icon: KeyRound });
         list.push({ name: 'Audit Logs', view: 'logbook', icon: ShieldCheck });
         break;
     }

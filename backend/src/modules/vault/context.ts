@@ -37,6 +37,7 @@ import { makeReadAuditHistory } from './application/commands/read-audit-history'
 import { makeEnrollMfa } from './application/commands/enroll-mfa';
 import { makeRequestDetokenization } from './application/commands/request-detokenization';
 import { makeApproveStepUpChallenge } from './application/commands/approve-step-up-challenge';
+import { makeVerifyMfa } from './application/commands/verify-mfa';
 import { OtpAuthTotpVerifier } from './infrastructure/mfa/totp-verifier';
 import {
   __setTokenizeAadhaarImpl,
@@ -45,8 +46,12 @@ import {
   __setRequestDetokenizationImpl,
   __setApproveStepUpChallengeImpl,
   __setListMfaFactorsImpl,
+  __setVerifyMfaImpl,
+  __setRevokeMfaImpl,
+  VaultError,
   type MfaFactorMeta,
 } from '../../aadhaarVault';
+import { UserRole } from '../../db';
 
 export interface VaultContext {
   tokenize: ReturnType<typeof makeTokenizeAadhaar>;
@@ -73,6 +78,40 @@ export interface BuildVaultContextResult {
   failureReason?: 'no-mongo' | 'key-manager-init-failed';
   /** The underlying error when `failureReason` is set. */
   failureError?: Error;
+}
+
+/**
+ * Map FLN UserRole → Vault ActorRoleEnum (vault command's caller-
+ * context shape). Mirrors the helper in
+ * `backend/src/routes/aadhaarDetokenize.ts:85-94` — kept local to
+ * this file so the in-process shim wiring doesn't depend on a
+ * route module. The two helpers must stay in sync; the
+ * mapping is small enough that a duplicate is cheaper than a
+ * cross-module import that would re-introduce a circular dep.
+ *
+ * Accepts both the FLN `UserRole` enum (lowercase strings) and the
+ * vault-side role union (uppercase strings); both shapes are
+ * passed to this helper from the route layer. The mapping table
+ * itself is identical because both sides encode the same
+ * authorization intent — the difference is only the string
+ * convention.
+ */
+function flnRoleToVaultRole(
+  role: UserRole | 'TEACHER' | 'SCHOOL_ADMIN' | 'STATE_ADMIN' | 'SUPER_ADMIN' | 'SERVICE',
+): 'SUPER_ADMIN' | 'STATE_ADMIN' | 'SERVICE' {
+  if (role === UserRole.SUPERADMIN || role === 'SUPER_ADMIN') return 'SUPER_ADMIN';
+  if (
+    role === UserRole.ADMIN ||
+    role === UserRole.DISTRICT_ADMIN ||
+    role === UserRole.BLOCK_ADMIN ||
+    role === 'STATE_ADMIN'
+  ) {
+    return 'STATE_ADMIN';
+  }
+  // SERVICE is never assigned to an end-user — it is the fallback
+  // for any unexpected caller. The detokenize endpoints restrict to
+  // admin roles only, so this branch is purely defensive.
+  return 'SERVICE';
 }
 
 /**
@@ -171,6 +210,19 @@ export async function buildVaultContext(
     challenges,
     events,
   });
+  // NEW (Wave 2A): the verifyMfa command is the only path that
+  // transitions PENDING_ENROLLMENT -> ENROLLED and writes the
+  // MFA_ENROLLMENT_VERIFIED audit row. The route layer's
+  // POST /api/me/mfa/verify handler invokes it after a
+  // successful TOTP submission during enrollment.
+  const verifyMfa = makeVerifyMfa({
+    keyManager,
+    totp,
+    mfa,
+    events,
+    bumpVerifyAttempts: (id) => mfa.incrementVerifyAttempts(id),
+    transitionToEnrolled: (id) => mfa.transitionToEnrolled(id),
+  });
 
   const ctx: VaultContext = {
     tokenize,
@@ -254,11 +306,21 @@ export async function buildVaultContext(
     // contract is `Record<string, unknown>` (it forwards the
     // response as-is). Convert via a deliberate object spread
     // so the call-site shape is stable.
+    //
+    // `lifecycleState` and `verifyAttempts` MUST be projected —
+    // the FLN /api/me/mfa/enroll route maps the result through
+    // `factorMetaToWire` and then JSON-serializes the response.
+    // Omitting them produces `lifecycleState: undefined` in the
+    // wire JSON (the field is silently dropped), which the
+    // Security panel + Aadhaar reveal dialog both treat as
+    // "not enrolled" — exactly the bug class this shim exists
+    // to prevent.
     const factorObj: Record<string, unknown> = {
       factorId: result.factor.factorId,
       actor: result.factor.actor,
       factorType: result.factor.factorType,
       status: result.factor.status,
+      lifecycleState: result.factor.lifecycleState,
       label: result.factor.label,
       algorithm: result.factor.algorithm,
       digits: result.factor.digits,
@@ -266,6 +328,7 @@ export async function buildVaultContext(
       lastUsedAt: result.factor.lastUsedAt,
       expiresAt: result.factor.expiresAt,
       createdAt: result.factor.createdAt,
+      verifyAttempts: result.factor.verifyAttempts,
     };
     return {
       factorId: result.factorId,
@@ -334,6 +397,14 @@ export async function buildVaultContext(
   // the FLN layer can detect a returning admin and skip the
   // QR re-enrollment step. We project the Mongo MfaFactor to
   // the wire shape and never expose `encryptedSecret`.
+  //
+  // `lifecycleState` and `verifyAttempts` MUST be projected —
+  // the Security panel and Aadhaar reveal dialog both branch
+  // on `lifecycleState` to decide between Pending / Enrolled /
+  // "not enrolled". Omitting them makes a freshly-verified
+  // factor look like "not enrolled" to the UI, which in turn
+  // makes the Security panel fire a POST /api/me/mfa/enroll
+  // that returns 409 ALREADY_ENROLLED.
   __setListMfaFactorsImpl(async (params) => {
     const rows = await mfa.listActiveByActor(params.actor);
     const factors: MfaFactorMeta[] = rows.map(r => ({
@@ -341,6 +412,7 @@ export async function buildVaultContext(
       actor: r.actor,
       factorType: r.factorType,
       status: r.status,
+      lifecycleState: r.lifecycleState,
       label: r.label,
       algorithm: r.algorithm,
       digits: r.digits,
@@ -348,8 +420,84 @@ export async function buildVaultContext(
       lastUsedAt: r.lastUsedAt ? r.lastUsedAt.toISOString() : null,
       expiresAt: r.expiresAt ? r.expiresAt.toISOString() : null,
       createdAt: r.createdAt.toISOString(),
+      verifyAttempts: r.verifyAttempts,
     }));
     return { factors };
+  });
+
+  // Install the in-process verifyMfa implementation on the
+  // legacy shim. After this returns, calls to
+  // `verifyMfaFactor({factorId, code, actor, context})` from
+  // the FLN /api/me/mfa/verify route layer go through the
+  // module, not HTTP. The route passes the JWT subject as
+  // `actor` so the command refuses to verify a factor
+  // belonging to a different actor (the cross-admin attack
+  // guard). On a successful verify against a PENDING_ENROLLMENT
+  // factor, the command atomically transitions the factor to
+  // ENROLLED and writes a separate MFA_ENROLLMENT_VERIFIED
+  // audit row in addition to the existing MFA_VERIFY row.
+  __setVerifyMfaImpl(async (params) => {
+    const result = await verifyMfa({
+      factorId: params.factorId,
+      code: params.code,
+      expectedActor: params.actor,
+      context: {
+        actorId: params.context.actorId,
+        actorRole: flnRoleToVaultRole(params.context.actorRole),
+        reason: params.context.reason,
+        requestId: params.context.requestId,
+      },
+    });
+    // Flatten the discriminated union into the wire shape
+    // the route consumes. The route needs:
+    //   - success: factorId + lifecycleState + (optional) delta
+    //   - failure: factorId (nullable) + reason
+    // The command's success returns the post-`markUsed` factor
+    // row; we project its `lifecycleState` and `factorId`.
+    if (result.valid) {
+      return {
+        valid: true,
+        factorId: result.factorId,
+        lifecycleState: (result.factor as any).lifecycleState,
+        delta: result.delta,
+      };
+    }
+    // `result.valid === false` here — TypeScript should narrow,
+    // but the discriminant access via `result.reason` requires
+    // a direct reference. The cast keeps the type checker
+    // honest across the union split.
+    const failure = result as { valid: false; factorId: string | null; reason: string };
+    return {
+      valid: false,
+      factorId: failure.factorId,
+      reason: failure.reason as
+        | 'FACTOR_NOT_FOUND'
+        | 'FACTOR_REVOKED'
+        | 'FACTOR_EXPIRED'
+        | 'ACTOR_MISMATCH'
+        | 'CODE_MISMATCH',
+    };
+  });
+
+  // Install the in-process revokeMfa implementation on the
+  // legacy shim. The route layer's actor-isolation check
+  // (factor.actor === user.email) runs BEFORE this shim is
+  // invoked, so the shim is a thin delegation to the
+  // repository. The shim does not write an audit row — the
+  // route does, with the FLN admin's id.
+  __setRevokeMfaImpl(async (params) => {
+    const row = await mfa.revoke(params.factorId);
+    if (!row) {
+      // Unknown factor — the route's pre-check should have
+      // caught this; surface a typed error so the route's
+      // VaultError handler returns 404.
+      throw new VaultError(
+        'FACTOR_NOT_FOUND',
+        404,
+        `no vault_mfa_factors row matches id=${params.factorId}.`,
+      );
+    }
+    return { factorId: row.factorId, status: 'revoked' };
   });
 
   return { ctx };

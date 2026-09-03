@@ -53,13 +53,11 @@ import express from 'express';
 import { dbStore, UserRole } from '../db';
 import { getAuthUser, canAccessStudent } from '../auth';
 import {
-  enrollMfa,
   requestDetokenization,
   approveStepUpChallenge,
   detokenizeAadhaar,
   listMfaFactors,
   VaultError,
-  type EnrollMfaResult,
   type RequestDetokenizationResult,
   type ApproveStepUpResult,
   type DetokenizeResult,
@@ -157,126 +155,35 @@ export function registerAadhaarDetokenizeRoutes(app: express.Express): void {
   // ─────────────────────────────────────────────────────────────────────────
   // 0. GET /api/students/:id/aadhaar/mfa/me
   //
-  //    Pre-flight probe for the dialog. Returns the caller's active TOTP
-  //    factors (newest first) so the frontend can decide whether to show
-  //    the first-time QR/enrollment screen or the returning-admin
-  //    "enter your 6-digit code" screen. The `studentId` in the URL is
-  //    only a permission anchor (it is checked by `authorizeAndResolve
-  //    Student` so a non-admin cannot probe this endpoint). The returned
-  //    `factors` are SCOPED to the caller (`actor = JWT subject email`)
-  //    — the student id is never used to fetch factors. No encrypted
-  //    secret is exposed; the shape matches `MfaFactorMeta` on the
-  //    aadhaarVault shim.
+  //    DEPRECATED (Wave 2A): this per-student surface is replaced by
+  //    the account-level `/api/me/mfa/factors` route. The handler
+  //    responds `410 Gone` with the new endpoint's URL so any open
+  //    browser tab during deployment redirects cleanly. The route
+  //    itself is preserved (not deleted) — see MIGRATION_PLAN.md for
+  //    the deferred cleanup phase.
   // ─────────────────────────────────────────────────────────────────────────
-  app.get('/api/students/:id/aadhaar/mfa/me', async (req, res) => {
-    const student = await authorizeAndResolveStudent(req, res, req.params.id);
-    if (!student) return; // reply already sent (401/403/404/409)
-
-    const user = getAuthUser(req)!;
-    try {
-      const result = await listMfaFactors({ actor: user.email });
-      res.json(result);
-    } catch (err: any) {
-      if (err instanceof VaultError) return vaultErrorToHttp(err, res);
-      console.error('Aadhaar vault list-factors unexpected error:', err?.code ?? 'UNKNOWN', err?.message);
-      res.status(500).json({ error: 'vault_internal', message: 'Failed to read MFA factors.' });
-    }
+  app.get('/api/students/:id/aadhaar/mfa/me', (_req, res) => {
+    res.status(410).json({
+      error: 'MOVED',
+      newEndpoint: '/api/me/mfa/factors',
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────
   // 1. POST /api/students/:id/aadhaar/mfa/enroll
   //
-  //    The admin enrolls a TOTP factor for THEMSELVES (not for the student).
-  //    Two paths:
-  //      a. Returning admin — at least one active factor exists. The
-  //         route returns `{ factorId, alreadyEnrolled: true, factor }`
-  //         WITHOUT minting a new secret. The dialog skips the QR
-  //         screen and goes straight to the TOTP entry. The
-  //         `otpauthUri` is intentionally absent on this path so the
-  //         secret never re-crosses the wire.
-  //      b. First-time admin — no active factor. The route mints a
-  //         fresh factor via `enrollMfa` and returns
-  //         `{ factorId, otpauthUri, factor, alreadyEnrolled: false }`.
-  //         The dialog renders the QR for the admin to scan once.
-  //
-  //    The same TOTP secret is bound to the same `actor` for the
-  //    lifetime of the admin's enrollment. The browser does not
-  //    persist the secret; only the admin's authenticator app holds
-  //    it (and a `manual setup URI` toggle in the dialog lets them
-  //    re-add the account on a new device).
+  //    DEPRECATED (Wave 2A): replaced by the account-level
+  //    `/api/me/mfa/enroll` route. The handler responds `410 Gone`
+  //    with the new endpoint's URL. The enrollment surface is
+  //    account-level — there is no studentId in the URL anymore,
+  //    because the authenticator app belongs to the admin, not the
+  //    student.
   // ─────────────────────────────────────────────────────────────────────────
-  app.post('/api/students/:id/aadhaar/mfa/enroll', async (req, res) => {
-    const user = getAuthUser(req);
-    if (!user) return res.status(401).json({ error: 'Unauthorized' });
-    if (!DETOKENIZE_ROLES.includes(user.role)) {
-      return res.status(403).json({ error: 'Forbidden — detokenization requires an admin role.' });
-    }
-    const student = await authorizeAndResolveStudent(req, res, req.params.id);
-    if (!student) return; // reply already sent
-
-    const label = typeof req.body?.label === 'string' && req.body.label.length > 0
-      ? req.body.label
-      : `FLN admin (${user.email})`;
-
-    // ── Returning-admin path: reuse the existing factor. ─────────────
-    // We look up the caller's active factors BEFORE minting a new
-    // secret. If any exist we echo the most recent factorId back so
-    // the dialog can skip enrollment and the step-up request can
-    // bind to it directly. The actor binding is the JWT subject
-    // (user.email), so a different admin can never observe or
-    // collide with this lookup.
-    try {
-      const existing = await listMfaFactors({ actor: user.email });
-      if (existing.factors.length > 0) {
-        const f = existing.factors[0];
-        res.json({
-          factorId: f.factorId,
-          alreadyEnrolled: true,
-          factor: f,
-        });
-        return;
-      }
-    } catch (err: any) {
-      if (err instanceof VaultError) return vaultErrorToHttp(err, res);
-      // A factor-list failure should not block a first-time enrollment
-      // — fall through to the enroll path. We still log it so a
-      // regression on the read side is visible in ops.
-      console.warn('Aadhaar vault list-factors in enroll handler:', err?.code ?? 'UNKNOWN', err?.message);
-    }
-
-    // ── First-time-admin path: mint a new TOTP factor. ──────────────
-    try {
-      const result: EnrollMfaResult = await enrollMfa({
-        actor: user.email,
-        label,
-        context: {
-          email: user.email,
-          actorRole: flnRoleToVaultRole(user.role),
-          requestId: `fln-mfa-enroll-${Date.now()}`,
-        },
-      });
-      res.json({
-        factorId: result.factorId,
-        otpauthUri: result.otpauthUri,
-        alreadyEnrolled: false,
-        // Projected factor envelope (no encryptedSecret on the wire for the
-        // admin UI — they only need the QR; the secret is already in their
-        // authenticator).
-        factor: {
-          factorId: result.factor.factorId,
-          actor: result.factor.actor,
-          label: result.factor.label,
-          algorithm: result.factor.algorithm,
-          digits: result.factor.digits,
-          period: result.factor.period,
-          createdAt: result.factor.createdAt,
-        },
-      });
-    } catch (err: any) {
-      if (err instanceof VaultError) return vaultErrorToHttp(err, res);
-      console.error('Aadhaar vault MFA enrollment unexpected error:', err?.code ?? 'UNKNOWN', err?.message);
-      res.status(500).json({ error: 'vault_internal', message: 'MFA enrollment failed.' });
-    }
+  app.post('/api/students/:id/aadhaar/mfa/enroll', (_req, res) => {
+    res.status(410).json({
+      error: 'MOVED',
+      newEndpoint: '/api/me/mfa/enroll',
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -285,18 +192,50 @@ export function registerAadhaarDetokenizeRoutes(app: express.Express): void {
   //    Body: `{ factorId }` — the admin supplies ONLY the factor id they
   //    enrolled with. The backend resolves the student's vault token id
   //    from MongoDB (NOT from the body) and mints a challenge.
+  //
+  //    NEW (Wave 2A): the route refuses to mint a step-up challenge
+  //    unless the caller has at least one `ENROLLED` factor. A
+  //    `PENDING_ENROLLMENT` factor (just minted, awaiting first
+  //    verify) is NOT eligible for step-up — the admin must complete
+  //    enrollment first. This preserves the hard invariant: the
+  //    step-up path does NOT mint factors; it only SELECTS an
+  //    existing ENROLLED factor.
   // ─────────────────────────────────────────────────────────────────────────
   app.post('/api/students/:id/aadhaar/step-up/request', async (req, res) => {
     const student = await authorizeAndResolveStudent(req, res, req.params.id);
     if (!student) return;
 
     const user = getAuthUser(req)!;
-    const factorId = typeof req.body?.factorId === 'string' ? req.body.factorId : '';
-    if (factorId.length === 0) {
+    const requestedFactorId = typeof req.body?.factorId === 'string' ? req.body.factorId : '';
+    if (requestedFactorId.length === 0) {
       return res.status(400).json({ error: 'Missing factorId in request body.' });
     }
 
+    // Preflight: the caller must have at least one ENROLLED
+    // factor. We do this BEFORE the vault call so a 403 surfaces
+    // fast and never reaches `requestDetokenization` (which would
+    // then call `mfa.getById` and surface a different code). The
+    // explicit factorId-in-body check below is belt-and-braces:
+    // a malicious admin could supply a PENDING_ENROLLMENT factor
+    // id from the response of the new /api/me/mfa/enroll endpoint.
     try {
+      const factorsResult = await listMfaFactors({ actor: user.email });
+      const enrolled = factorsResult.factors.find(
+        (f) => (f as any).lifecycleState === 'ENROLLED',
+      );
+      if (!enrolled) {
+        return res.status(403).json({ error: 'MFA_NOT_ENROLLED' });
+      }
+      // The factor id in the body must match the caller's
+      // ENROLLED factor. This is the cross-admin attack guard
+      // for step-up — a compromised admin cannot reuse a
+      // PENDING_ENROLLMENT factor id (or another admin's
+      // factor id) to mint a challenge.
+      if (enrolled.factorId !== requestedFactorId) {
+        return res.status(403).json({ error: 'MFA_NOT_ENROLLED' });
+      }
+      const factorId = enrolled.factorId;
+
       const result: RequestDetokenizationResult = await requestDetokenization({
         tokenId: student.aadhaarTokenId!, // validated non-null in authorizeAndResolveStudent
         factorId,

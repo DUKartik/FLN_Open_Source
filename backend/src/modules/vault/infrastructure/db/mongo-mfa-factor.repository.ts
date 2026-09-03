@@ -28,6 +28,7 @@ import { VAULT_COLLECTIONS } from '../../schema/collections';
 import type {
   InsertMfaFactorInput,
   MfaFactor,
+  MfaFactorLifecycleState,
   MfaFactorRepository,
   MfaFactorStatus,
   MfaFactorType,
@@ -39,6 +40,7 @@ interface FactorDoc {
   actor: string;
   factorType: string;
   status: string;
+  lifecycleState: MfaFactorLifecycleState;
   label: string;
   encryptedSecret: Buffer;
   algorithm: string;
@@ -47,6 +49,7 @@ interface FactorDoc {
   lastUsedAt: Date | null;
   expiresAt: Date | null;
   createdAt: Date;
+  verifyAttempts: number;
 }
 
 function toFactor(doc: FactorDoc): MfaFactor {
@@ -55,6 +58,7 @@ function toFactor(doc: FactorDoc): MfaFactor {
     actor: doc.actor,
     factorType: doc.factorType as MfaFactorType,
     status: doc.status as MfaFactorStatus,
+    lifecycleState: doc.lifecycleState,
     label: doc.label,
     encryptedSecret: toBuffer(doc.encryptedSecret),
     algorithm: doc.algorithm,
@@ -63,6 +67,7 @@ function toFactor(doc: FactorDoc): MfaFactor {
     lastUsedAt: doc.lastUsedAt,
     expiresAt: doc.expiresAt,
     createdAt: doc.createdAt,
+    verifyAttempts: doc.verifyAttempts,
   };
 }
 
@@ -79,6 +84,7 @@ export class MongoMfaFactorRepository implements MfaFactorRepository {
       actor: rec.actor,
       factorType: rec.factorType,
       status: 'active',
+      lifecycleState: 'PENDING_ENROLLMENT',
       label: rec.label,
       encryptedSecret: rec.encryptedSecret,
       algorithm: rec.algorithm,
@@ -87,6 +93,7 @@ export class MongoMfaFactorRepository implements MfaFactorRepository {
       lastUsedAt: null,
       expiresAt: rec.expiresAt ?? null,
       createdAt: new Date(),
+      verifyAttempts: 0,
     };
     await this.col().insertOne(doc);
     return toFactor(doc);
@@ -129,10 +136,47 @@ export class MongoMfaFactorRepository implements MfaFactorRepository {
   }
 
   async listActiveByActor(actor: string): Promise<MfaFactor[]> {
+    // Tightened to require `lifecycleState: 'ENROLLED'`. This is the
+    // single source of truth that the reveal flow is restricted to
+    // verified factors — a freshly minted `PENDING_ENROLLMENT` factor
+    // is invisible to step-up. The existing per-reveal code path
+    // calls this method, so no changes are needed in the reveal
+    // route / command — the filter alone guarantees the invariant.
     const docs = await this.col()
-      .find({ actor, status: 'active' })
+      .find({ actor, status: 'active', lifecycleState: 'ENROLLED' })
       .sort({ createdAt: -1 })
       .toArray();
     return docs.map(toFactor);
+  }
+
+  async findActivePendingByActor(actor: string): Promise<MfaFactor[]> {
+    const docs = await this.col()
+      .find({ actor, status: 'active', lifecycleState: 'PENDING_ENROLLMENT' })
+      .sort({ createdAt: -1 })
+      .toArray();
+    return docs.map(toFactor);
+  }
+
+  async transitionToEnrolled(factorId: string): Promise<MfaFactor | null> {
+    // Atomic CAS: only fires on the PENDING_ENROLLMENT -> ENROLLED
+    // transition. The status guard ensures a second call returns
+    // null (the route uses the null return to distinguish first-
+    // verify from re-verify).
+    const result = await this.col().findOneAndUpdate(
+      { _id: factorId, status: 'active', lifecycleState: 'PENDING_ENROLLMENT' },
+      { $set: { lifecycleState: 'ENROLLED' } },
+      { returnDocument: 'after' },
+    );
+    return result ? toFactor(result as FactorDoc) : null;
+  }
+
+  async incrementVerifyAttempts(factorId: string): Promise<void> {
+    // Atomic $inc of verifyAttempts. Called once per verifyMfaFactor
+    // attempt (success or failure) so the counter reflects all
+    // attempts. No return value.
+    await this.col().updateOne(
+      { _id: factorId },
+      { $inc: { verifyAttempts: 1 } },
+    );
   }
 }

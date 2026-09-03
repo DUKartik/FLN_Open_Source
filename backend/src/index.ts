@@ -34,6 +34,7 @@ import { registerInterventionRoutes } from './routes/interventions';
 import { registerBestPracticeRoutes } from './routes/bestPractices';
 import { registerStudentRoutes } from './routes/students';
 import { registerAadhaarDetokenizeRoutes } from './routes/aadhaarDetokenize';
+import { registerMfaEnrollmentRoutes } from './routes/mfaEnrollment';
 import { registerWorksheetRoutes } from './routes/worksheets';
 import { registerEvaluationRoutes } from './routes/evaluation';
 import { registerAnalyticsRoutes } from './routes/analytics';
@@ -235,6 +236,8 @@ registerStatsRoutes(app);
   registerStudentRoutes(app);
   // Admin Step-Up detokenization (Aadhaar Vault — see aadhaarDetokenize.ts).
   registerAadhaarDetokenizeRoutes(app);
+  // Account-level MFA enrollment (Wave 2A — see mfaEnrollment.ts).
+  registerMfaEnrollmentRoutes(app);
 
   // In-process vault module — the only path (Phase 7 deletion of the
   // standalone Fastify+Postgres microservice is complete). Always wired;

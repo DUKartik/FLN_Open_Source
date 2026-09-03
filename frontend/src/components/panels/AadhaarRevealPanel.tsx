@@ -28,6 +28,9 @@ interface Props {
   students?: Student[];
   currentUser: User;
   token: string;
+  /** Routes the user to the dedicated MFA enrollment surface (SecurityPanel)
+   *  when the reveal dialog needs to send them to enroll a factor first. */
+  onSelectView?: (view: string) => void;
 }
 
 const ALLOWED_ROLES: ReadonlyArray<UserRole> = [
@@ -57,7 +60,7 @@ type FetchState = {
   error: string | null;
 };
 
-export const AadhaarRevealPanel: React.FC<Props> = ({ students: propStudents, currentUser, token }) => {
+export const AadhaarRevealPanel: React.FC<Props> = ({ students: propStudents, currentUser, token, onSelectView }) => {
   const [query, setQuery] = useState('');
   const debouncedQuery = useDebouncedValue(query, 300);
   const [page, setPage] = useState(1);
@@ -309,6 +312,7 @@ export const AadhaarRevealPanel: React.FC<Props> = ({ students: propStudents, cu
           student={target}
           token={token}
           onClose={() => setTarget(null)}
+          onNavigateToSecurity={onSelectView ? () => onSelectView('security') : undefined}
         />
       )}
     </div>

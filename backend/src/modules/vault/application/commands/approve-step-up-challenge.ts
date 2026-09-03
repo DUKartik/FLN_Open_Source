@@ -191,15 +191,18 @@ export class ApproveStepUpChallengeCommandError extends Error {
  */
 const DEFAULT_WINDOW = 3;
 
-/**
- * Default length of a TOTP code. 8 digits (vs. the historical 6) is
- * the Authy / Microsoft Authenticator "advanced" mode and is
- * supported by every modern authenticator app. It gives ~10^8 codes
- * per step which is a comfortable brute-force margin even with a
- * 90s window. Cross-digit verification is not supported.
- */
-const DEFAULT_DIGITS = 8;
-
+// ---------------------------------------------------------------------------
+// Accepted TOTP code lengths.
+//
+// The freshly-minted default is 6 digits (see
+// `infrastructure/mfa/totp-verifier.ts:DEFAULT_DIGITS`) but this
+// command also accepts 8-digit codes for factors enrolled before the
+// default flipped — they carry `digits: 8` in their row, the
+// per-factor `meta.digits` is read downstream at
+// `buildTotpForVerify` time, and forcing a re-enroll would be
+// unnecessary user friction. Cross-digit verification (e.g. a
+// 6-digit code against an 8-digit factor) is rejected: the row
+// drives the validator's digit count, the input must match.
 // ---------------------------------------------------------------------------
 // Command factory
 // ---------------------------------------------------------------------------
@@ -262,10 +265,23 @@ export function makeApproveStepUpChallenge(deps: ApproveStepUpChallengeDeps) {
         "code must be a string.",
       );
     }
-    if (cmd.code.length !== DEFAULT_DIGITS || !/^\d+$/.test(cmd.code)) {
+    // Accept 6 OR 8 digit codes. The freshly-minted default is
+    // 6 digits (matching the UI's "6-digit code" label). Factors
+    // enrolled before the default flipped carry `digits: 8` and
+    // must keep working without forcing the user to revoke +
+    // re-enroll. The actual TOTP validation downstream reads the
+    // per-factor `meta.digits` to construct the `otpauth.TOTP`,
+    // so the validation itself uses whatever the row says.
+    if (cmd.code.length !== 6 && cmd.code.length !== 8) {
       throw new ApproveStepUpChallengeCommandError(
         "INVALID_INPUT",
-        `code must be a ${DEFAULT_DIGITS}-digit decimal string.`,
+        "code must be a 6- or 8-digit decimal string.",
+      );
+    }
+    if (!/^\d+$/.test(cmd.code)) {
+      throw new ApproveStepUpChallengeCommandError(
+        "INVALID_INPUT",
+        "code must be a 6- or 8-digit decimal string.",
       );
     }
     if (cmd.window !== undefined) {

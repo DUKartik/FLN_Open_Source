@@ -19,7 +19,7 @@
  *
  * No plaintext Aadhaar is ever printed; assertions only test FOR it.
  */
-import { test, after } from 'node:test';
+import { test, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -76,6 +76,16 @@ type Factor = {
   period: number;
   algorithm: string;
   label: string;
+  // NEW (Wave 2A): every factor in this test file is treated as
+  // already-ENROLLED so the new step-up preflight
+  // (aadhaarDetokenize.ts:222-228) accepts it. The stub at
+  // `__setEnrollMfaImpl` sets this to 'ENROLLED' on creation.
+  // Pre-seeded rows below also carry this field. The verify +
+  // revoke tests in this file don't exercise the
+  // PENDING_ENROLLMENT lifecycle — that lives in
+  // `mfa-enrollment.test.ts`.
+  lifecycleState: 'PENDING_ENROLLMENT' | 'ENROLLED';
+  verifyAttempts: number;
 };
 type Challenge = {
   challengeId: string;
@@ -100,6 +110,7 @@ const { dbStore } = await import('../src/db');
 const { JWT_SECRET } = await import('../src/auth');
 const { registerStudentRoutes } = await import('../src/routes/students');
 const { registerAadhaarDetokenizeRoutes } = await import('../src/routes/aadhaarDetokenize');
+const { registerMfaEnrollmentRoutes } = await import('../src/routes/mfaEnrollment');
 const aadhaarVaultModule = await import('../src/aadhaarVault');
 
 // ---------------------------------------------------------------------------
@@ -133,6 +144,14 @@ aadhaarVaultModule.__setTokenizeAadhaarImpl(async (rawAadhar) => {
 // compute a valid TOTP code later; this is the only path the test has
 // to know the secret (the in-process command's secret is sealed via
 // KeyManager.sealSecret and never round-trips back through the wire).
+//
+// NEW (Wave 2A): the factor is created with `lifecycleState:
+// 'ENROLLED'` because these tests don't exercise the verify-then-
+// enroll lifecycle (that lives in `mfa-enrollment.test.ts`). The
+// step-up preflight at aadhaarDetokenize.ts:222-228 requires the
+// caller's factor to be ENROLLED before it mints a challenge;
+// without this field set, every step-up call in this file would
+// short-circuit to 403 MFA_NOT_ENROLLED.
 aadhaarVaultModule.__setEnrollMfaImpl(async (params) => {
   const factorId = 'fac-' + crypto.randomUUID();
   const secretBytes = crypto.randomBytes(20);
@@ -148,6 +167,8 @@ aadhaarVaultModule.__setEnrollMfaImpl(async (params) => {
     period,
     algorithm,
     label: params.label || params.actor,
+    lifecycleState: 'ENROLLED',
+    verifyAttempts: 0,
   };
   factors.set(factorId, f);
   // Synthesize a fake otpauth URI (never parsed by tests; included for
@@ -168,6 +189,8 @@ aadhaarVaultModule.__setEnrollMfaImpl(async (params) => {
       lastUsedAt: null,
       expiresAt: null,
       createdAt: new Date().toISOString(),
+      lifecycleState: 'ENROLLED',
+      verifyAttempts: 0,
     },
   };
 });
@@ -180,6 +203,11 @@ aadhaarVaultModule.__setEnrollMfaImpl(async (params) => {
 // minted; the new "returning admin" tests can pre-seed `factors` and
 // the stub will surface them. Revoked factors are always hidden,
 // mirroring `MfaFactorRepository.listActiveByActor`.
+//
+// NEW (Wave 2A): the stub now surfaces `lifecycleState` on the
+// wire shape so the step-up preflight (aadhaarDetokenize.ts:222-228)
+// can filter to ENROLLED factors. Without this field, the preflight
+// would always reject step-up requests as 403 MFA_NOT_ENROLLED.
 aadhaarVaultModule.__setListMfaFactorsImpl(async (params) => {
   const matching = Array.from(factors.values())
     .filter(f => f.actor === params.actor && f.status === 'ACTIVE');
@@ -196,6 +224,8 @@ aadhaarVaultModule.__setListMfaFactorsImpl(async (params) => {
       lastUsedAt: null,
       expiresAt: null,
       createdAt: new Date().toISOString(),
+      lifecycleState: f.lifecycleState,
+      verifyAttempts: f.verifyAttempts,
     })),
   };
 });
@@ -328,6 +358,12 @@ const app = express();
 app.use(express.json());
 registerStudentRoutes(app);
 registerAadhaarDetokenizeRoutes(app);
+// NEW (Wave 2A): register the account-level /api/me/mfa/* routes
+// so the retained step-up tests can drive the new account-level
+// enroll endpoint, and the new test cases (14, 15, 16, 17, 21)
+// can hit the deprecated per-student surface for the 410 Gone
+// assertions.
+registerMfaEnrollmentRoutes(app);
 
 const apiServer: http.Server = await new Promise(resolve => {
   const s = app.listen(0, '127.0.0.1', () => resolve(s as http.Server));
@@ -365,6 +401,17 @@ async function registerStudent(raw: string, name: string): Promise<string> {
   return res.json.id;
 }
 
+// NEW (Wave 2A): reset the in-memory state before every test so
+// the new account-level enroll route's "already enrolled" 409
+// path doesn't bleed across tests. The retained step-up tests
+// each call `/api/me/mfa/enroll` once; without a reset, the
+// second test would 409 against the first test's factor.
+beforeEach(() => {
+  factors.clear();
+  challenges.clear();
+  tokens.clear();
+});
+
 after(async () => {
   // Reset in-process impls so subsequent test files (if any) see
   // the default HTTP-backed implementation.
@@ -384,8 +431,11 @@ test('TEST 7: unauthorized roles (TEACHER) get 403 on every detokenize endpoint'
   // Register a student so we have a valid id to act on.
   const studentId = await registerStudent('101010101010', 'Test 7 Student');
 
+  // The deprecated `/mfa/enroll` path is removed from this list —
+  // it now returns 410 Gone for ALL callers, which is asserted
+  // separately in TEST 16. The remaining 3 step-up / detokenize
+  // paths are still role-gated.
   for (const path of [
-    `/api/students/${studentId}/aadhaar/mfa/enroll`,
     `/api/students/${studentId}/aadhaar/step-up/request`,
     `/api/students/${studentId}/aadhaar/step-up/approve`,
     `/api/students/${studentId}/aadhaar/detokenize`,
@@ -394,9 +444,15 @@ test('TEST 7: unauthorized roles (TEACHER) get 403 on every detokenize endpoint'
     assert.equal(res.status, 403, `TEACHER should be 403 on ${path}, got ${res.status}: ${JSON.stringify(res.json)}`);
   }
 
-  // Volunteer / school / teacher roles also blocked — quick sanity sweep.
+  // The new account-level /api/me/mfa/enroll is the only path
+  // teachers can still hit. The role gate should still 403 them.
+  const newEnroll = await api('POST', '/api/me/mfa/enroll', TEACHER, { label: 'test 7' });
+  assert.equal(newEnroll.status, 403, `TEACHER should be 403 on /api/me/mfa/enroll, got ${newEnroll.status}`);
+
+  // Volunteer / school roles also blocked on the account-level
+  // endpoint — quick sanity sweep.
   for (const email of ['gps-mt-001@fln.org', 'vol.rahul@fln.org']) {
-    const res = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, email, {});
+    const res = await api('POST', '/api/me/mfa/enroll', email, { label: 'test 7' });
     assert.equal(res.status, 403, `${email} should be 403, got ${res.status}`);
   }
 });
@@ -406,7 +462,7 @@ test('TEST 8: SUPERADMIN can drive full Step-Up lifecycle and recover original r
   const studentId = await registerStudent(raw, 'Test 8 Reveal');
 
   // (a) enroll MFA — now in-process via the stub.
-  const enrollRes = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, SUPERADMIN, {
+  const enrollRes = await api('POST', '/api/me/mfa/enroll', SUPERADMIN, {
     label: 'Test 8 admin',
   });
   assert.equal(enrollRes.status, 200, `enroll failed: ${JSON.stringify(enrollRes.json)}`);
@@ -455,7 +511,7 @@ test('TEST 8: SUPERADMIN can drive full Step-Up lifecycle and recover original r
 
 test('TEST 9: invalid TOTP code rejected at the approve step', async () => {
   const studentId = await registerStudent('303030303030', 'Test 9 Student');
-  const enrollRes = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, SUPERADMIN, {});
+  const enrollRes = await api('POST', '/api/me/mfa/enroll', SUPERADMIN, {});
   assert.equal(enrollRes.status, 200);
   const reqRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/request`, SUPERADMIN, {
     factorId: enrollRes.json.factorId,
@@ -490,7 +546,7 @@ test('TEST 10: cross-student token substitution rejected (token comes from DB on
   const bobId = await registerStudent('505050505050', 'Test 10 Bob');
 
   // Enroll an admin factor.
-  const enrollRes = await api('POST', `/api/students/${aliceId}/aadhaar/mfa/enroll`, SUPERADMIN, {});
+  const enrollRes = await api('POST', '/api/me/mfa/enroll', SUPERADMIN, {});
   assert.equal(enrollRes.status, 200);
 
   // Mint a challenge for ALICE (the URL path is /students/:id/... and the
@@ -545,7 +601,7 @@ test('TEST 11: DISTRICT_ADMIN / BLOCK_ADMIN can drive Step-Up lifecycle', async 
   const studentId = await registerStudent('606060606060', 'Test 11 District');
 
   for (const admin of [DISTRICT_ADMIN, BLOCK_ADMIN]) {
-    const enrollRes = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, admin, {});
+    const enrollRes = await api('POST', '/api/me/mfa/enroll', admin, {});
     assert.equal(enrollRes.status, 200, `${admin} enroll: ${enrollRes.status}`);
     const reqRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/request`, admin, {
       factorId: enrollRes.json.factorId,
@@ -567,7 +623,7 @@ test('TEST 11: DISTRICT_ADMIN / BLOCK_ADMIN can drive Step-Up lifecycle', async 
 
 test('TEST 12: expired challenge returns 410 and detokenize is forbidden', async () => {
   const studentId = await registerStudent('707070707070', 'Test 12 Expired');
-  const enrollRes = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, SUPERADMIN, {});
+  const enrollRes = await api('POST', '/api/me/mfa/enroll', SUPERADMIN, {});
   assert.equal(enrollRes.status, 200);
   // Force 50ms TTL for this test.
   challengeTtlMs = 50;
@@ -602,7 +658,7 @@ test('TEST 13: CAS gate — two concurrent consume() calls collapse to one winne
   // calls. One must succeed; the other must surface
   // CHALLENGE_CONSUMED.
   const studentId = await registerStudent('808080808080', 'Test 13 CAS');
-  const enrollRes = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, SUPERADMIN, {});
+  const enrollRes = await api('POST', '/api/me/mfa/enroll', SUPERADMIN, {});
   assert.equal(enrollRes.status, 200);
   const reqRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/request`, SUPERADMIN, {
     factorId: enrollRes.json.factorId,
@@ -651,176 +707,160 @@ test('TEST 13: CAS gate — two concurrent consume() calls collapse to one winne
 });
 
 // ============================================================================
-// TOTP enrollment / step-up lifecycle fix — new tests
+// Step-up preflight + 410 Gone deprecation — new tests (Wave 3, Wave 2A)
 // ============================================================================
 //
-// The tests below cover the changes that move the FLN enroll route from
-// "always mint a new factor" to "reuse the caller's existing active factor".
-// This is the bug fix that turns the Aadhaar Reveal dialog from a per-reveal
-// QR re-scan into a one-time enrollment + step-up-for-each-reveal flow.
+// These tests cover the hard invariant introduced in Wave 2A:
+//   POST /api/students/:id/aadhaar/step-up/request MUST refuse to mint
+//   a challenge unless the caller has at least one ENROLLED factor.
+//   The preflight is at aadhaarDetokenize.ts:222-228 and gates the
+//   request before any token resolution or vault call.
 //
-// What we prove:
-//   1. Returning-admin enroll returns the existing factor (no new
-//      `otpauthUri`, no new secret, `alreadyEnrolled: true`).
-//   2. First-time-admin enroll mints a fresh factor (sets
-//      `alreadyEnrolled: false` and returns the QR URI).
-//   3. `GET /mfa/me` is actor-scoped — admin A cannot read admin B
-//      factors.
-//   4. `GET /mfa/me` hides revoked factors.
-//   5. Step-up challenge against a revoked factor is rejected with 4xx.
-//   6. The TOTP code never appears in any captured console output.
-//   7. The plaintext Aadhaar never appears in any captured console output.
+// Also covered: the 410 Gone deprecation envelope for the two
+// per-student routes replaced by the account-level
+// `/api/me/mfa/*` surface.
+//
+// **Hard invariant.** Tests 14, 15 prove that a step-up request
+// with no enrolled factor is rejected with 403 MFA_NOT_ENROLLED —
+// the step-up path does NOT mint a TOTP factor. A malicious admin
+// cannot game the system by triggering step-up to bootstrap an
+// authenticator on demand.
 
-test('TOTP UX: returning admin enroll reuses the existing factor', async () => {
-  // Drop all SUPERADMIN factors so the assertion is unambiguous about
-  // which factor the route will reuse. (Other admin roles' factors
-  // are untouched; this test only cares about the caller — the
-  // SUPERADMIN — seeing a returning-admin flow.)
-  for (const [id, f] of factors.entries()) {
-    if (f.actor === SUPERADMIN) factors.delete(id);
-  }
-  const studentId = await registerStudent('909090909090', 'Test TOTP Returning');
-  const preSeededId = 'fac-preseeded-' + crypto.randomUUID();
-  factors.set(preSeededId, {
-    factorId: preSeededId,
+// ─── Test 14 ────────────────────────────────────────────────────────────
+test('TEST 14: step-up/request with NO enrolled factor returns 403 MFA_NOT_ENROLLED', async () => {
+  // The caller (SUPERADMIN) has never enrolled. The preflight must
+  // reject BEFORE any token resolution. To make the test precise
+  // (the route's preflight runs AFTER `authorizeAndResolveStudent`),
+  // we register a real student so the authorization gate passes and
+  // the preflight is the next thing to fire.
+  const studentId = await registerStudent('141414141414', 'Test 14 No Factor');
+  // No enrollment — the factors Map is empty for SUPERADMIN.
+
+  const res = await api('POST', `/api/students/${studentId}/aadhaar/step-up/request`, SUPERADMIN, {
+    factorId: 'fac-ghost',
+  });
+  assert.equal(res.status, 403, `expected 403 MFA_NOT_ENROLLED, got ${res.status}: ${JSON.stringify(res.json)}`);
+  assert.equal(res.json.error, 'MFA_NOT_ENROLLED');
+
+  // No challenge row was created — the preflight short-circuited.
+  assert.equal(challenges.size, 0, 'preflight must not mint a challenge');
+  // No new factor was created — the preflight does NOT bootstrap
+  // authenticator enrollment on demand. (This is the hard invariant
+  // — see the comment block at the top of this section.)
+  assert.equal(factors.size, 0, 'preflight must NOT mint a TOTP factor');
+});
+
+// ─── Test 15 ────────────────────────────────────────────────────────────
+test('TEST 15: step-up/request with PENDING_ENROLLMENT (not yet verified) factor returns 403 MFA_NOT_ENROLLED', async () => {
+  // The caller enrolled an authenticator but has NOT verified it
+  // with a TOTP code. The factor exists but is in lifecycleState
+  // PENDING_ENROLLMENT. The preflight must reject — the admin
+  // must complete the verify step before the step-up flow can be
+  // used. This is the same `lifecycleState === 'ENROLLED'` check
+  // that prevents a half-enrolled factor from minting challenges.
+  const studentId = await registerStudent('151515151515', 'Test 15 Pending Factor');
+
+  // Pre-seed a PENDING_ENROLLMENT factor for SUPERADMIN directly
+  // in the in-memory Map. The /api/me/mfa/enroll stub always
+  // mints ENROLLED factors in this test file (the lifecycle
+  // transition is the responsibility of `mfa-enrollment.test.ts`,
+  // not this one). We pre-seed to construct the "pending only"
+  // state the test needs.
+  const pendingId = 'fac-pending-' + crypto.randomUUID();
+  factors.set(pendingId, {
+    factorId: pendingId,
     actor: SUPERADMIN,
     secretBytes: crypto.randomBytes(20),
     status: 'ACTIVE',
     digits: 6,
     period: 30,
     algorithm: 'SHA1',
-    label: 'pre-existing factor',
+    label: 'pending-only factor',
+    lifecycleState: 'PENDING_ENROLLMENT',
+    verifyAttempts: 0,
   });
-  const beforeCount = factors.size;
 
-  const enrollRes = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, SUPERADMIN, {});
-  assert.equal(enrollRes.status, 200, `enroll should 200: ${enrollRes.status} ${JSON.stringify(enrollRes.json)}`);
-
-  // The route must hand back the pre-existing factor, NOT a new one.
-  assert.equal(enrollRes.json.alreadyEnrolled, true, 'returning admin must get alreadyEnrolled=true');
-  assert.equal(enrollRes.json.factorId, preSeededId, 'must echo the existing factorId');
-  assert.equal(enrollRes.json.otpauthUri, undefined, 'returning admin must NOT receive a new otpauth URI');
-  assert.equal(factors.size, beforeCount, 'no new factor may be created on the returning path');
-});
-
-test('TOTP UX: first-time admin enroll mints a new factor with alreadyEnrolled=false', async () => {
-  // The listMfaFactors stub at the top of this file starts from the
-  // current `factors` Map state. If a previous test left a factor for
-  // the superadmin, drop it so this test runs from a clean slate.
-  for (const [id, f] of factors.entries()) {
-    if (f.actor === SUPERADMIN) factors.delete(id);
-  }
-  const studentId = await registerStudent('919191919191', 'Test TOTP First Time');
-  const beforeCount = factors.size;
-
-  const enrollRes = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, SUPERADMIN, {
-    label: 'first-time',
+  // The preflight filters to ENROLLED only — the pending factor
+  // is invisible to it. The route returns 403.
+  const res = await api('POST', `/api/students/${studentId}/aadhaar/step-up/request`, SUPERADMIN, {
+    factorId: pendingId,
   });
-  assert.equal(enrollRes.status, 200, `enroll should 200: ${enrollRes.status} ${JSON.stringify(enrollRes.json)}`);
-  assert.equal(enrollRes.json.alreadyEnrolled, false, 'first-time admin must get alreadyEnrolled=false');
-  assert.equal(typeof enrollRes.json.otpauthUri, 'string', 'first-time admin must receive the QR URI');
-  assert.equal(factors.size, beforeCount + 1, 'exactly one new factor should be created');
+  assert.equal(res.status, 403);
+  assert.equal(res.json.error, 'MFA_NOT_ENROLLED');
+
+  // No challenge was minted.
+  assert.equal(challenges.size, 0);
 });
 
-test('TOTP UX: GET /mfa/me is actor-scoped (admin A cannot read admin B)', async () => {
-  for (const [id] of factors.entries()) factors.delete(id);
+// ─── Test 16 ────────────────────────────────────────────────────────────
+test('TEST 16: POST /api/students/:id/aadhaar/mfa/enroll returns 410 Gone with MOVED envelope', async () => {
+  // The per-student enroll surface is deprecated in favor of the
+  // account-level `/api/me/mfa/enroll`. The route returns 410
+  // with a `{ error: 'MOVED', newEndpoint }` envelope so any
+  // open browser tab during deployment redirects cleanly.
+  const studentId = await registerStudent('161616161616', 'Test 16 410 Enroll');
 
-  const f1 = 'fac-A-' + crypto.randomUUID();
-  const f2 = 'fac-B-' + crypto.randomUUID();
-  factors.set(f1, { factorId: f1, actor: SUPERADMIN, secretBytes: crypto.randomBytes(20), status: 'ACTIVE', digits: 6, period: 30, algorithm: 'SHA1', label: 'A' });
-  factors.set(f2, { factorId: f2, actor: DISTRICT_ADMIN, secretBytes: crypto.randomBytes(20), status: 'ACTIVE', digits: 6, period: 30, algorithm: 'SHA1', label: 'B' });
+  const res = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, SUPERADMIN, {
+    label: 'test 16',
+  });
+  assert.equal(res.status, 410, `expected 410 Gone, got ${res.status}: ${JSON.stringify(res.json)}`);
+  assert.equal(res.json.error, 'MOVED');
+  assert.equal(res.json.newEndpoint, '/api/me/mfa/enroll');
 
-  const studentId = await registerStudent('929292929292', 'Test TOTP Scope');
-
-  const asSuper = await api('GET', `/api/students/${studentId}/aadhaar/mfa/me`, SUPERADMIN);
-  assert.equal(asSuper.status, 200);
-  assert.equal(Array.isArray(asSuper.json.factors), true, 'factors must be an array');
-  const superIds = asSuper.json.factors.map((f: any) => f.factorId);
-  assert.deepEqual(superIds, [f1], 'superadmin must see ONLY their own factor');
-
-  const asDistrict = await api('GET', `/api/students/${studentId}/aadhaar/mfa/me`, DISTRICT_ADMIN);
-  assert.equal(asDistrict.status, 200);
-  const districtIds = asDistrict.json.factors.map((f: any) => f.factorId);
-  assert.deepEqual(districtIds, [f2], 'district admin must see ONLY their own factor');
+  // The 410 path MUST NOT mint a factor. The preflight above
+  // checks for any factor, and the route is hard-coded to
+  // 410 BEFORE any enrollment-side vault call.
+  assert.equal(factors.size, 0, '410 path must not mint a factor');
 });
 
-test('TOTP UX: GET /mfa/me hides revoked factors', async () => {
-  for (const [id] of factors.entries()) factors.delete(id);
+// ─── Test 17 ────────────────────────────────────────────────────────────
+test('TEST 17: GET /api/students/:id/aadhaar/mfa/me returns 410 Gone with MOVED envelope', async () => {
+  const studentId = await registerStudent('171717171717', 'Test 17 410 Me');
 
-  const active = 'fac-active-' + crypto.randomUUID();
-  const revoked = 'fac-revoked-' + crypto.randomUUID();
-  factors.set(active, { factorId: active, actor: SUPERADMIN, secretBytes: crypto.randomBytes(20), status: 'ACTIVE', digits: 6, period: 30, algorithm: 'SHA1', label: 'A' });
-  factors.set(revoked, { factorId: revoked, actor: SUPERADMIN, secretBytes: crypto.randomBytes(20), status: 'REVOKED', digits: 6, period: 30, algorithm: 'SHA1', label: 'R' });
-
-  const studentId = await registerStudent('939393939393', 'Test TOTP Revoked');
   const res = await api('GET', `/api/students/${studentId}/aadhaar/mfa/me`, SUPERADMIN);
-  assert.equal(res.status, 200);
-  const ids = res.json.factors.map((f: any) => f.factorId);
-  assert.deepEqual(ids, [active], 'revoked factors must be hidden from /mfa/me');
+  assert.equal(res.status, 410);
+  assert.equal(res.json.error, 'MOVED');
+  assert.equal(res.json.newEndpoint, '/api/me/mfa/factors');
 });
 
-test('TOTP UX: step-up challenge against a revoked factor is rejected', async () => {
-  for (const [id] of factors.entries()) factors.delete(id);
+// ─── Test 21 (regression: end-to-end step-up still works) ───────────────
+test('TEST 21: end-to-end step-up reveal still works after the Wave 2A changes', async () => {
+  // Regression — a sanity check that the full Step-Up lifecycle
+  // (enroll → request → approve → detokenize) still works through
+  // the new account-level enroll + the existing per-student step-up
+  // routes. The hard invariant is that step-up SELECTS an
+  // existing ENROLLED factor; this test confirms that path is
+  // functional end-to-end.
+  const raw = '181818181818';
+  const studentId = await registerStudent(raw, 'Test 21 Regression');
 
-  const revoked = 'fac-rev-' + crypto.randomUUID();
-  factors.set(revoked, { factorId: revoked, actor: SUPERADMIN, secretBytes: crypto.randomBytes(20), status: 'REVOKED', digits: 6, period: 30, algorithm: 'SHA1', label: 'R' });
+  // Enroll via the new account-level endpoint.
+  const enrollRes = await api('POST', '/api/me/mfa/enroll', SUPERADMIN, {});
+  assert.equal(enrollRes.status, 200, `enroll: ${JSON.stringify(enrollRes.json)}`);
+  const factorId = enrollRes.json.factorId;
 
-  const studentId = await registerStudent('949494949494', 'Test TOTP Revoked Step-up');
+  // Mint a challenge — the preflight must PASS because the stub
+  // surfaces `lifecycleState: 'ENROLLED'` on the new factor.
+  const reqRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/request`, SUPERADMIN, { factorId });
+  assert.equal(reqRes.status, 200, `step-up/request: ${reqRes.status} ${JSON.stringify(reqRes.json)}`);
+  const challengeId = reqRes.json.challengeId;
 
-  // /mfa/me hides revoked factors, so enroll will NOT reuse it; the
-  // route will try to mint a new one. Drive step-up/request directly
-  // against the revoked factorId — the in-process stub FACTOR_NOT_ACTIVE
-  // rejection surfaces as 4xx.
-  const reqRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/request`, SUPERADMIN, {
-    factorId: revoked,
-  });
-  assert.ok(reqRes.status >= 400 && reqRes.status < 500, `expected 4xx, got ${reqRes.status}`);
-  assert.equal(reqRes.json.error, 'FACTOR_NOT_ACTIVE', `unexpected error code: ${reqRes.json.error}`);
-});
+  // Approve with the correct TOTP code.
+  const fac = factors.get(factorId)!;
+  const code = totpCode(fac.secretBytes);
+  const approveRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/approve`, SUPERADMIN, { challengeId, code });
+  assert.equal(approveRes.status, 200, `step-up/approve: ${JSON.stringify(approveRes.json)}`);
 
-test('TOTP UX: TOTP code and plaintext Aadhaar are never logged', async () => {
-  // Reset the factors Map to a clean state and capture every console
-  // line emitted by the route layer across a full reveal flow.
-  for (const [id] of factors.entries()) factors.delete(id);
-  const captured: string[] = [];
-  const origLog = console.log;
-  const origErr = console.error;
-  const origWarn = console.warn;
-  const origInfo = console.info;
-  const grab = (...args: unknown[]) => captured.push(args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' '));
-  console.log = grab as typeof console.log;
-  console.error = grab as typeof console.error;
-  console.warn = grab as typeof console.warn;
-  console.info = grab as typeof console.info;
-  try {
-    const studentId = await registerStudent('959595959595', 'Test TOTP No Leak');
-    const enrollRes = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, SUPERADMIN, {});
-    assert.equal(enrollRes.status, 200);
-    const factorId = enrollRes.json.factorId;
-    const fac = factors.get(factorId)!;
-    const code = totpCode(fac.secretBytes);
-    const reqRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/request`, SUPERADMIN, { factorId });
-    assert.equal(reqRes.status, 200);
-    const challengeId = reqRes.json.challengeId;
-    const approveRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/approve`, SUPERADMIN, { challengeId, code });
-    assert.equal(approveRes.status, 200);
-    const detokRes = await api('POST', `/api/students/${studentId}/aadhaar/detokenize`, SUPERADMIN, { challengeId });
-    assert.equal(detokRes.status, 200);
-    assert.equal(detokRes.json.aadhaar, '959595959595', 'sanity: detokenize should return the seeded raw Aadhaar');
-  } finally {
-    console.log = origLog;
-    console.error = origErr;
-    console.warn = origWarn;
-    console.info = origInfo;
-  }
-  // TOTP code: 6 digits, plain text. Must not appear anywhere.
-  for (const line of captured) {
-    const totpRegex = /\b\d{6}\b/g;
-    assert.equal(totpRegex.test(line), false, `TOTP code leaked in console output: ${line}`);
-  }
-  // Plaintext Aadhaar: 12 digits, plain text. Must not appear anywhere.
-  for (const line of captured) {
-    const plainRegex = /\b\d{12}\b/g;
-    assert.equal(plainRegex.test(line), false, `plaintext Aadhaar leaked in console output: ${line}`);
-  }
+  // Detokenize to round-trip the plaintext.
+  const detokRes = await api('POST', `/api/students/${studentId}/aadhaar/detokenize`, SUPERADMIN, { challengeId });
+  assert.equal(detokRes.status, 200, `detokenize: ${JSON.stringify(detokRes.json)}`);
+  assert.equal(detokRes.json.aadhaar, raw, 'plaintext must round-trip');
+
+  // No TOTP code or plaintext Aadhaar leaks in any captured console
+  // line — regression for the hygiene invariants from the
+  // previously-removed TOTP UX test.
+  // (We don't capture console here; the leak assertion is
+  // independent of this test and lives in mfa-enrollment.test.ts
+  // as test 19/20. The regression test's job is to prove the
+  // flow still completes, not to re-prove hygiene.)
 });

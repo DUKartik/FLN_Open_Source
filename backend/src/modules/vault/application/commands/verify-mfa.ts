@@ -119,6 +119,9 @@ export interface VerifyMfaCommand {
   factorId: string;
   code: string;
   context: VerifyMfaCallerContext;
+  /** NEW (Wave 2A): when set, reject if factor.actor !== expectedActor.
+   *  The cross-admin attack guard — the route always passes user.email
+   *  so a factor belonging to a different actor can never be verified. */
   expectedActor?: string;
   window?: number;
 }
@@ -199,11 +202,18 @@ export class VerifyMfaCommandError extends Error {
 /** Default clock-skew window in TOTP time-steps (±1). */
 const DEFAULT_WINDOW = 1;
 
-/** Default length of a TOTP code. Matches the v0.1 port default
- *  (digits=6). Other digit lengths (rare) must be configured at
- *  enrollment; the command does not support cross-digit verification. */
-const DEFAULT_DIGITS = 6;
-
+// ---------------------------------------------------------------------------
+// Accepted TOTP code lengths.
+//
+// The freshly-minted default is 6 digits (see
+// `infrastructure/mfa/totp-verifier.ts:DEFAULT_DIGITS`) but this
+// command also accepts 8-digit codes for factors enrolled before the
+// default flipped — they carry `digits: 8` in their row, the
+// per-factor `meta.digits` is read downstream at
+// `buildTotpForVerify` time, and forcing a re-enroll would be
+// unnecessary user friction. Cross-digit verification (e.g. a
+// 6-digit code against an 8-digit factor) is rejected: the row
+// drives the validator's digit count, the input must match.
 // ---------------------------------------------------------------------------
 // Command factory
 // ---------------------------------------------------------------------------
@@ -225,6 +235,16 @@ export interface VerifyMfaDeps {
    * `markUsed` call, and the event publish agree.
    */
   clock?: () => Date;
+  /** NEW (Wave 2A): atomic counter bump on every verify attempt
+   *  (success or failure). Optional so existing test fixtures
+   *  with a minimal deps object keep compiling. */
+  bumpVerifyAttempts?: (factorId: string) => Promise<void>;
+  /** NEW (Wave 2A): atomic PENDING_ENROLLMENT -> ENROLLED
+   *  transition. Called after a successful verify when the
+   *  factor is in PENDING_ENROLLMENT. Returns the updated
+   *  row, or null if already ENROLLED (so the route can
+   *  distinguish first-verify from re-verify). */
+  transitionToEnrolled?: (factorId: string) => Promise<MfaFactor | null>;
 }
 
 /**
@@ -268,18 +288,25 @@ export function makeVerifyMfa(deps: VerifyMfaDeps) {
         "code must be a string.",
       );
     }
-    // The code must be exactly `digits` decimal digits. We
-    // do NOT coerce to a number first because leading
-    // zeros would be lost. The `digits` field is
-    // discovered from the factor row below — we use
-    // `DEFAULT_DIGITS` (6) for the *initial* shape check
-    // so a 4-digit code with a 6-digit factor still
-    // gets rejected fast, before we touch the DB.
-    const codeDigits = DEFAULT_DIGITS;
-    if (cmd.code.length !== codeDigits || !/^\d+$/.test(cmd.code)) {
+    // The code must be a 6- or 8-digit decimal string. We accept
+    // both because (a) the freshly-minted default is 6 digits
+    // (matching the UI label) and (b) factors enrolled before the
+    // default flipped carry `digits: 8` and must keep working
+    // without forcing the user to revoke + re-enroll. The actual
+    // TOTP validation below reads the per-factor `meta.digits` from
+    // the row, so the validation itself uses the right digit count
+    // regardless of what was minted. We do NOT coerce to a number
+    // first because leading zeros would be lost.
+    if (cmd.code.length !== 6 && cmd.code.length !== 8) {
       throw new VerifyMfaCommandError(
         "INVALID_INPUT",
-        `code must be a ${codeDigits}-digit decimal string.`,
+        "code must be a 6- or 8-digit decimal string.",
+      );
+    }
+    if (!/^\d+$/.test(cmd.code)) {
+      throw new VerifyMfaCommandError(
+        "INVALID_INPUT",
+        "code must be a 6- or 8-digit decimal string.",
       );
     }
     if (
@@ -320,6 +347,25 @@ export function makeVerifyMfa(deps: VerifyMfaDeps) {
         "FACTOR_NOT_FOUND",
         now,
       );
+    }
+
+    // -----------------------------------------------------------------
+    // 2b. NEW (Wave 2A): bump the verifyAttempts counter on
+    //    every attempt (success or failure). The counter
+    //    reflects ALL attempts and is exposed to the admin
+    //    self-service UI. Called BEFORE any early-exit check
+    //    so even an actor-mismatch or revoked-factor attempt
+    //    increments the counter — it is the audit of "this
+    //    factor was probed", not "this factor succeeded".
+    // -----------------------------------------------------------------
+    if (deps.bumpVerifyAttempts) {
+      try {
+        await deps.bumpVerifyAttempts(cmd.factorId);
+      } catch (_bumpErr) {
+        // Best-effort: a counter bump failure must not break the
+        // verify path. The factor is still looked up, the code
+        // is still checked, the audit row is still written.
+      }
     }
 
     // -----------------------------------------------------------------
@@ -465,6 +511,52 @@ export function makeVerifyMfa(deps: VerifyMfaDeps) {
         ),
       );
 
+      // -------------------------------------------------------------
+      // 8b. NEW (Wave 2A): on a successful verify against a
+      //    PENDING_ENROLLMENT factor, atomically transition
+      //    the factor to ENROLLED and write a separate
+      //    `MFA_ENROLLMENT_VERIFIED` audit row. The transition
+      //    is captured BEFORE the audit row, so the meta
+      //    includes the post-bump `verifyAttempts` count. The
+      //    `MFA_VERIFY` row above is per-attempt; this row is
+      //    the one-time lifecycle event.
+      // -------------------------------------------------------------
+      if (
+        deps.transitionToEnrolled !== undefined &&
+        factor.lifecycleState === "PENDING_ENROLLMENT"
+      ) {
+        const updated = await deps.transitionToEnrolled(factor.factorId);
+        if (updated) {
+          await dbStore.addLog(
+            vaultLogbookEntry(
+              {
+                identityId: null,
+                actor: cmd.context.actorId,
+                action: "MFA_ENROLLMENT_VERIFIED",
+                outcome: "allow",
+                reason: cmd.context.reason,
+                requestId: cmd.context.requestId ?? null,
+                meta: {
+                  factor_id: factor.factorId,
+                  factor_actor: factor.actor,
+                  admin_actor: cmd.context.actorId,
+                  admin_role: cmd.context.actorRole,
+                  verify_attempts: (updated as any).verifyAttempts,
+                },
+              },
+              {
+                userId: cmd.context.userId ?? '',
+                schoolId: cmd.context.schoolId ?? '',
+                schoolName: cmd.context.schoolName ?? '',
+                actorRole: cmd.context.actorRole,
+              },
+              mintVaultLogId(new Date()),
+              new Date(),
+            ),
+          );
+        }
+      }
+
       await deps.events.publish({
         type: "MfaVerified",
         factorId: factor.factorId,
@@ -539,6 +631,48 @@ async function recordFailure(
       now,
     ),
   );
+
+  // -----------------------------------------------------------------
+  // NEW (Wave 2A): write an `MFA_ENROLLMENT_FAILED` audit row
+  // ONLY when the factor is in PENDING_ENROLLMENT. A re-verify
+  // failure on an already-ENROLLED factor is a step-up concern,
+  // not an enrollment concern, so the row is suppressed for
+  // the ENROLLED case. The factor is null on the
+  // FACTOR_NOT_FOUND branch (the row is also suppressed there
+  // — we cannot tell the lifecycle state of a row that does
+  // not exist). All other branches (FACTOR_REVOKED /
+  // FACTOR_EXPIRED / ACTOR_MISMATCH / CODE_MISMATCH) carry a
+  // non-null factor with a meaningful lifecycleState.
+  // -----------------------------------------------------------------
+  if (factor && factor.lifecycleState === "PENDING_ENROLLMENT") {
+    await dbStore.addLog(
+      vaultLogbookEntry(
+        {
+          identityId: null,
+          actor: cmd.context.actorId,
+          action: "MFA_ENROLLMENT_FAILED",
+          outcome: "deny",
+          reason: cmd.context.reason,
+          requestId: cmd.context.requestId ?? null,
+          meta: {
+            factor_id: factor.factorId,
+            factor_actor: factor.actor,
+            failure_reason: reason,
+            admin_actor: cmd.context.actorId,
+            admin_role: cmd.context.actorRole,
+          },
+        },
+        {
+          userId: cmd.context.userId ?? '',
+          schoolId: cmd.context.schoolId ?? '',
+          schoolName: cmd.context.schoolName ?? '',
+          actorRole: cmd.context.actorRole,
+        },
+        mintVaultLogId(new Date()),
+        new Date(),
+      ),
+    );
+  }
 
   await deps.events.publish({
     type: "MfaVerificationFailed",
