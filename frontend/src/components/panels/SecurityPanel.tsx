@@ -161,7 +161,7 @@ export const SecurityPanel: React.FC<Props> = ({ currentUser, token }) => {
 
   const onVerify = async () => {
     if (!/^[0-9]{6,10}$/.test(code)) {
-      setVerifyError('Enter the 6-digit code from your authenticator app.');
+      setVerifyError('Enter the 6- or 8-digit code from your authenticator app.');
       return;
     }
     setVerifying(true);
@@ -227,13 +227,21 @@ export const SecurityPanel: React.FC<Props> = ({ currentUser, token }) => {
   );
 
   const renderPending = () => (
-    <div className="space-y-4">
+    <form
+      className="space-y-4"
+      onSubmit={e => {
+        e.preventDefault();
+        if (code.length >= 6 && !verifying) onVerify();
+      }}
+    >
       <p className="text-sm font-medium text-slate-700 dark:text-slate-200">
         Authenticator — awaiting first code
       </p>
       <div>
         <p className="text-xs text-slate-500 dark:text-slate-400 mb-2">
-          Scan this QR in your authenticator app, then enter the 6-digit code below.
+          Scan this QR in your authenticator app, then enter the 6- or 8-digit code below.
+          Press <kbd className="mx-1 px-1 py-0.5 rounded border border-slate-300 dark:border-slate-600 bg-slate-50 dark:bg-slate-800 font-mono text-[10px]">Enter</kbd>
+          to submit.
         </p>
         {qrDataUrl ? (
           <img
@@ -266,7 +274,7 @@ export const SecurityPanel: React.FC<Props> = ({ currentUser, token }) => {
           htmlFor="security-totp"
           className="block text-sm font-medium mb-1 text-slate-700 dark:text-slate-200"
         >
-          6-digit code from your app
+          TOTP code from your app
         </label>
         <input
           id="security-totp"
@@ -288,8 +296,7 @@ export const SecurityPanel: React.FC<Props> = ({ currentUser, token }) => {
         )}
       </div>
       <button
-        type="button"
-        onClick={onVerify}
+        type="submit"
         disabled={verifying || code.length < 6}
         className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-400 text-white rounded font-medium"
       >
@@ -304,10 +311,10 @@ export const SecurityPanel: React.FC<Props> = ({ currentUser, token }) => {
         Restart enrollment (mint a new QR)
       </button>
       <p className="text-xs text-slate-500 dark:text-slate-400">
-        This QR appears once. After this enrollment, you'll only need to type the 6-digit
-        code from your authenticator app.
+        This QR appears once. After this enrollment, you'll only need to type the 6- or
+        8-digit code from your authenticator app.
       </p>
-    </div>
+    </form>
   );
 
   const renderEnrolled = () => {

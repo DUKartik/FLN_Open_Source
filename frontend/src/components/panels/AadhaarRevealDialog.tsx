@@ -37,7 +37,7 @@ type Props = {
   onNavigateToSecurity?: () => void;
 };
 
-const AUTO_CLEAR_MS = 60_000; // 60s — see AadhaarRevealPanel.tsx comment
+const AUTO_CLEAR_MS = 60_000; // 60s safety net — primary path is the "Copy & Close" button
 const PREFLIGHT_TIMEOUT_MS = 8_000; // see comment on the preflight useEffect
 
 export const AadhaarRevealDialog: React.FC<Props> = ({ student, token, onClose, onNavigateToSecurity }) => {
@@ -205,7 +205,7 @@ export const AadhaarRevealDialog: React.FC<Props> = ({ student, token, onClose, 
 
   const onApprove = async () => {
     if (!/^[0-9]{6,10}$/.test(totpCode)) {
-      setErrorMsg('Enter a 6-digit TOTP code.');
+      setErrorMsg('Enter the 6- or 8-digit TOTP code from your authenticator app.');
       return;
     }
     setErrorMsg('');
@@ -221,6 +221,27 @@ export const AadhaarRevealDialog: React.FC<Props> = ({ student, token, onClose, 
       setErrorMsg(err?.message || 'Step-up approval failed.');
       setPhase('awaiting_totp'); // let the admin try again with a fresh code
     }
+  };
+
+  /** Copy the revealed plaintext to the clipboard and close the
+   *  dialog. The user explicitly asked for the popup to close as
+   *  soon as the Aadhaar is in hand — leaving it open for the full
+   *  auto-clear window is a footgun in shared offices. The clipboard
+   *  write goes through `navigator.clipboard.writeText` with a
+   *  user-gesture fallback for older browsers. */
+  const onCopyAndClose = async () => {
+    try {
+      if (navigator.clipboard?.writeText && aadhaar) {
+        await navigator.clipboard.writeText(aadhaar);
+      }
+    } catch {
+      // Clipboard write can fail under insecure contexts or strict
+      // permissions; fall through to closing the dialog so the
+      // plaintext doesn't linger in the DOM longer than needed.
+    }
+    setAadhaar('');
+    setLast4('');
+    onClose();
   };
 
   const onDetokenize = async () => {
@@ -283,18 +304,26 @@ export const AadhaarRevealDialog: React.FC<Props> = ({ student, token, onClose, 
 
         {/* ── TOTP entry only (no QR — enrollment is SecurityPanel's job) ── */}
         {phase === 'awaiting_totp' && (
-          <div className="space-y-4">
+          <form
+            className="space-y-4"
+            onSubmit={e => {
+              e.preventDefault();
+              if (totpCode.length >= 6) onApprove();
+            }}
+          >
             <p className="text-sm text-slate-700 dark:text-slate-200 font-medium">
-              Enter the current 6-digit code from your authenticator app
+              Enter the current code from your authenticator app
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400">
               Open the same authenticator app you used to enroll (Google Authenticator,
-              Microsoft Authenticator, 1Password, etc.) and copy the 6-digit code it shows
-              for this FLN account. The code refreshes every 30 seconds.
+              Microsoft Authenticator, 1Password, etc.) and copy the 6- or 8-digit code it
+              shows for this FLN account. The code refreshes every 30 seconds — press
+              <kbd className="mx-1 px-1 py-0.5 rounded border border-slate-300 dark:border-slate-600 bg-slate-50 dark:bg-slate-800 font-mono text-[10px]">Enter</kbd>
+              to submit.
             </p>
             <div>
               <label htmlFor="totp" className="block text-sm font-medium mb-1 text-slate-700 dark:text-slate-200">
-                6-digit code
+                TOTP code
               </label>
               <input
                 id="totp"
@@ -312,14 +341,13 @@ export const AadhaarRevealDialog: React.FC<Props> = ({ student, token, onClose, 
               </p>
             </div>
             <button
-              type="button"
-              onClick={onApprove}
+              type="submit"
               disabled={totpCode.length < 6}
               className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-400 text-white rounded font-medium"
             >
               Approve &amp; Detokenize
             </button>
-          </div>
+          </form>
         )}
 
         {/* ── Not enrolled — route to SecurityPanel ──────────────────── */}
@@ -354,20 +382,28 @@ export const AadhaarRevealDialog: React.FC<Props> = ({ student, token, onClose, 
               <p className="text-xs font-medium text-amber-700 dark:text-amber-300 uppercase tracking-wide">
                 Plaintext Aadhaar — TEMPORARY
               </p>
-              <p className="mt-1 text-2xl font-mono font-semibold tracking-wider text-slate-900 dark:text-slate-100">
+              <p className="mt-1 text-2xl font-mono font-semibold tracking-wider text-slate-900 dark:text-slate-100 select-all">
                 {aadhaar}
               </p>
               <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
                 Auto-clears in <span className="font-mono">{countdown}s</span>.
-                Do not screenshot, copy to clipboard, or write down.
+                Do not screenshot, write down, or share with anyone who does not have a
+                legitimate need-to-know.
               </p>
             </div>
             <button
               type="button"
-              onClick={() => { setAadhaar(''); setLast4(''); setPhase('preflight'); }}
-              className="w-full py-2 bg-slate-200 hover:bg-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-900 dark:text-slate-100 rounded font-medium"
+              onClick={onCopyAndClose}
+              className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded font-medium"
             >
-              Clear Now
+              Copy &amp; Close
+            </button>
+            <button
+              type="button"
+              onClick={() => { setAadhaar(''); setLast4(''); setPhase('preflight'); }}
+              className="w-full py-2 bg-slate-200 hover:bg-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-900 dark:text-slate-100 rounded font-medium text-sm"
+            >
+              Clear without copying
             </button>
           </div>
         )}
