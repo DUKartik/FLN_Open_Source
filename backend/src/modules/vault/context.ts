@@ -44,6 +44,8 @@ import {
   __setEnrollMfaImpl,
   __setRequestDetokenizationImpl,
   __setApproveStepUpChallengeImpl,
+  __setListMfaFactorsImpl,
+  type MfaFactorMeta,
 } from '../../aadhaarVault';
 
 export interface VaultContext {
@@ -323,6 +325,31 @@ export async function buildVaultContext(
       approvedAt: result.approvedAt.toISOString(),
       verifiedFactorId: result.verifiedFactorId,
     };
+  });
+
+  // Install the read-side listMfaFactors implementation on the
+  // legacy shim. After this returns, calls to
+  // `listMfaFactors({actor})` from the FLN admin-enroll route
+  // return the caller's active TOTP factors (newest first) so
+  // the FLN layer can detect a returning admin and skip the
+  // QR re-enrollment step. We project the Mongo MfaFactor to
+  // the wire shape and never expose `encryptedSecret`.
+  __setListMfaFactorsImpl(async (params) => {
+    const rows = await mfa.listActiveByActor(params.actor);
+    const factors: MfaFactorMeta[] = rows.map(r => ({
+      factorId: r.factorId,
+      actor: r.actor,
+      factorType: r.factorType,
+      status: r.status,
+      label: r.label,
+      algorithm: r.algorithm,
+      digits: r.digits,
+      period: r.period,
+      lastUsedAt: r.lastUsedAt ? r.lastUsedAt.toISOString() : null,
+      expiresAt: r.expiresAt ? r.expiresAt.toISOString() : null,
+      createdAt: r.createdAt.toISOString(),
+    }));
+    return { factors };
   });
 
   return { ctx };

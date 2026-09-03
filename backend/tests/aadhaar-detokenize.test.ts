@@ -172,6 +172,34 @@ aadhaarVaultModule.__setEnrollMfaImpl(async (params) => {
   };
 });
 
+// (2b) listMfaFactors — read-side stub. The FLN enroll route calls this
+// first to detect a returning admin. By default it returns only the
+// caller's ACTIVE factors (insertion order — Maps preserve insertion
+// order, which the new test uses as a proxy for "newest first") so the
+// existing tests can continue to call `enroll` and have a new factor
+// minted; the new "returning admin" tests can pre-seed `factors` and
+// the stub will surface them. Revoked factors are always hidden,
+// mirroring `MfaFactorRepository.listActiveByActor`.
+aadhaarVaultModule.__setListMfaFactorsImpl(async (params) => {
+  const matching = Array.from(factors.values())
+    .filter(f => f.actor === params.actor && f.status === 'ACTIVE');
+  return {
+    factors: matching.map(f => ({
+      factorId: f.factorId,
+      actor: f.actor,
+      factorType: 'totp',
+      status: 'active',
+      label: f.label,
+      algorithm: f.algorithm,
+      digits: f.digits,
+      period: f.period,
+      lastUsedAt: null,
+      expiresAt: null,
+      createdAt: new Date().toISOString(),
+    })),
+  };
+});
+
 // (3) requestDetokenization — mint a step-up challenge bound to a
 // (token, factor) pair. TTL is per-test (defaults to 5 min).
 aadhaarVaultModule.__setRequestDetokenizationImpl(async (params) => {
@@ -620,4 +648,179 @@ test('TEST 13: CAS gate — two concurrent consume() calls collapse to one winne
   const finalCh = challenges.get(challengeId)!;
   assert.equal(finalCh.status, 'consumed', 'challenge must end in consumed state');
   void rejected; // both HTTP calls resolve; rejected list is empty.
+});
+
+// ============================================================================
+// TOTP enrollment / step-up lifecycle fix — new tests
+// ============================================================================
+//
+// The tests below cover the changes that move the FLN enroll route from
+// "always mint a new factor" to "reuse the caller's existing active factor".
+// This is the bug fix that turns the Aadhaar Reveal dialog from a per-reveal
+// QR re-scan into a one-time enrollment + step-up-for-each-reveal flow.
+//
+// What we prove:
+//   1. Returning-admin enroll returns the existing factor (no new
+//      `otpauthUri`, no new secret, `alreadyEnrolled: true`).
+//   2. First-time-admin enroll mints a fresh factor (sets
+//      `alreadyEnrolled: false` and returns the QR URI).
+//   3. `GET /mfa/me` is actor-scoped — admin A cannot read admin B
+//      factors.
+//   4. `GET /mfa/me` hides revoked factors.
+//   5. Step-up challenge against a revoked factor is rejected with 4xx.
+//   6. The TOTP code never appears in any captured console output.
+//   7. The plaintext Aadhaar never appears in any captured console output.
+
+test('TOTP UX: returning admin enroll reuses the existing factor', async () => {
+  // Drop all SUPERADMIN factors so the assertion is unambiguous about
+  // which factor the route will reuse. (Other admin roles' factors
+  // are untouched; this test only cares about the caller — the
+  // SUPERADMIN — seeing a returning-admin flow.)
+  for (const [id, f] of factors.entries()) {
+    if (f.actor === SUPERADMIN) factors.delete(id);
+  }
+  const studentId = await registerStudent('909090909090', 'Test TOTP Returning');
+  const preSeededId = 'fac-preseeded-' + crypto.randomUUID();
+  factors.set(preSeededId, {
+    factorId: preSeededId,
+    actor: SUPERADMIN,
+    secretBytes: crypto.randomBytes(20),
+    status: 'ACTIVE',
+    digits: 6,
+    period: 30,
+    algorithm: 'SHA1',
+    label: 'pre-existing factor',
+  });
+  const beforeCount = factors.size;
+
+  const enrollRes = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, SUPERADMIN, {});
+  assert.equal(enrollRes.status, 200, `enroll should 200: ${enrollRes.status} ${JSON.stringify(enrollRes.json)}`);
+
+  // The route must hand back the pre-existing factor, NOT a new one.
+  assert.equal(enrollRes.json.alreadyEnrolled, true, 'returning admin must get alreadyEnrolled=true');
+  assert.equal(enrollRes.json.factorId, preSeededId, 'must echo the existing factorId');
+  assert.equal(enrollRes.json.otpauthUri, undefined, 'returning admin must NOT receive a new otpauth URI');
+  assert.equal(factors.size, beforeCount, 'no new factor may be created on the returning path');
+});
+
+test('TOTP UX: first-time admin enroll mints a new factor with alreadyEnrolled=false', async () => {
+  // The listMfaFactors stub at the top of this file starts from the
+  // current `factors` Map state. If a previous test left a factor for
+  // the superadmin, drop it so this test runs from a clean slate.
+  for (const [id, f] of factors.entries()) {
+    if (f.actor === SUPERADMIN) factors.delete(id);
+  }
+  const studentId = await registerStudent('919191919191', 'Test TOTP First Time');
+  const beforeCount = factors.size;
+
+  const enrollRes = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, SUPERADMIN, {
+    label: 'first-time',
+  });
+  assert.equal(enrollRes.status, 200, `enroll should 200: ${enrollRes.status} ${JSON.stringify(enrollRes.json)}`);
+  assert.equal(enrollRes.json.alreadyEnrolled, false, 'first-time admin must get alreadyEnrolled=false');
+  assert.equal(typeof enrollRes.json.otpauthUri, 'string', 'first-time admin must receive the QR URI');
+  assert.equal(factors.size, beforeCount + 1, 'exactly one new factor should be created');
+});
+
+test('TOTP UX: GET /mfa/me is actor-scoped (admin A cannot read admin B)', async () => {
+  for (const [id] of factors.entries()) factors.delete(id);
+
+  const f1 = 'fac-A-' + crypto.randomUUID();
+  const f2 = 'fac-B-' + crypto.randomUUID();
+  factors.set(f1, { factorId: f1, actor: SUPERADMIN, secretBytes: crypto.randomBytes(20), status: 'ACTIVE', digits: 6, period: 30, algorithm: 'SHA1', label: 'A' });
+  factors.set(f2, { factorId: f2, actor: DISTRICT_ADMIN, secretBytes: crypto.randomBytes(20), status: 'ACTIVE', digits: 6, period: 30, algorithm: 'SHA1', label: 'B' });
+
+  const studentId = await registerStudent('929292929292', 'Test TOTP Scope');
+
+  const asSuper = await api('GET', `/api/students/${studentId}/aadhaar/mfa/me`, SUPERADMIN);
+  assert.equal(asSuper.status, 200);
+  assert.equal(Array.isArray(asSuper.json.factors), true, 'factors must be an array');
+  const superIds = asSuper.json.factors.map((f: any) => f.factorId);
+  assert.deepEqual(superIds, [f1], 'superadmin must see ONLY their own factor');
+
+  const asDistrict = await api('GET', `/api/students/${studentId}/aadhaar/mfa/me`, DISTRICT_ADMIN);
+  assert.equal(asDistrict.status, 200);
+  const districtIds = asDistrict.json.factors.map((f: any) => f.factorId);
+  assert.deepEqual(districtIds, [f2], 'district admin must see ONLY their own factor');
+});
+
+test('TOTP UX: GET /mfa/me hides revoked factors', async () => {
+  for (const [id] of factors.entries()) factors.delete(id);
+
+  const active = 'fac-active-' + crypto.randomUUID();
+  const revoked = 'fac-revoked-' + crypto.randomUUID();
+  factors.set(active, { factorId: active, actor: SUPERADMIN, secretBytes: crypto.randomBytes(20), status: 'ACTIVE', digits: 6, period: 30, algorithm: 'SHA1', label: 'A' });
+  factors.set(revoked, { factorId: revoked, actor: SUPERADMIN, secretBytes: crypto.randomBytes(20), status: 'REVOKED', digits: 6, period: 30, algorithm: 'SHA1', label: 'R' });
+
+  const studentId = await registerStudent('939393939393', 'Test TOTP Revoked');
+  const res = await api('GET', `/api/students/${studentId}/aadhaar/mfa/me`, SUPERADMIN);
+  assert.equal(res.status, 200);
+  const ids = res.json.factors.map((f: any) => f.factorId);
+  assert.deepEqual(ids, [active], 'revoked factors must be hidden from /mfa/me');
+});
+
+test('TOTP UX: step-up challenge against a revoked factor is rejected', async () => {
+  for (const [id] of factors.entries()) factors.delete(id);
+
+  const revoked = 'fac-rev-' + crypto.randomUUID();
+  factors.set(revoked, { factorId: revoked, actor: SUPERADMIN, secretBytes: crypto.randomBytes(20), status: 'REVOKED', digits: 6, period: 30, algorithm: 'SHA1', label: 'R' });
+
+  const studentId = await registerStudent('949494949494', 'Test TOTP Revoked Step-up');
+
+  // /mfa/me hides revoked factors, so enroll will NOT reuse it; the
+  // route will try to mint a new one. Drive step-up/request directly
+  // against the revoked factorId — the in-process stub FACTOR_NOT_ACTIVE
+  // rejection surfaces as 4xx.
+  const reqRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/request`, SUPERADMIN, {
+    factorId: revoked,
+  });
+  assert.ok(reqRes.status >= 400 && reqRes.status < 500, `expected 4xx, got ${reqRes.status}`);
+  assert.equal(reqRes.json.error, 'FACTOR_NOT_ACTIVE', `unexpected error code: ${reqRes.json.error}`);
+});
+
+test('TOTP UX: TOTP code and plaintext Aadhaar are never logged', async () => {
+  // Reset the factors Map to a clean state and capture every console
+  // line emitted by the route layer across a full reveal flow.
+  for (const [id] of factors.entries()) factors.delete(id);
+  const captured: string[] = [];
+  const origLog = console.log;
+  const origErr = console.error;
+  const origWarn = console.warn;
+  const origInfo = console.info;
+  const grab = (...args: unknown[]) => captured.push(args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' '));
+  console.log = grab as typeof console.log;
+  console.error = grab as typeof console.error;
+  console.warn = grab as typeof console.warn;
+  console.info = grab as typeof console.info;
+  try {
+    const studentId = await registerStudent('959595959595', 'Test TOTP No Leak');
+    const enrollRes = await api('POST', `/api/students/${studentId}/aadhaar/mfa/enroll`, SUPERADMIN, {});
+    assert.equal(enrollRes.status, 200);
+    const factorId = enrollRes.json.factorId;
+    const fac = factors.get(factorId)!;
+    const code = totpCode(fac.secretBytes);
+    const reqRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/request`, SUPERADMIN, { factorId });
+    assert.equal(reqRes.status, 200);
+    const challengeId = reqRes.json.challengeId;
+    const approveRes = await api('POST', `/api/students/${studentId}/aadhaar/step-up/approve`, SUPERADMIN, { challengeId, code });
+    assert.equal(approveRes.status, 200);
+    const detokRes = await api('POST', `/api/students/${studentId}/aadhaar/detokenize`, SUPERADMIN, { challengeId });
+    assert.equal(detokRes.status, 200);
+    assert.equal(detokRes.json.aadhaar, '959595959595', 'sanity: detokenize should return the seeded raw Aadhaar');
+  } finally {
+    console.log = origLog;
+    console.error = origErr;
+    console.warn = origWarn;
+    console.info = origInfo;
+  }
+  // TOTP code: 6 digits, plain text. Must not appear anywhere.
+  for (const line of captured) {
+    const totpRegex = /\b\d{6}\b/g;
+    assert.equal(totpRegex.test(line), false, `TOTP code leaked in console output: ${line}`);
+  }
+  // Plaintext Aadhaar: 12 digits, plain text. Must not appear anywhere.
+  for (const line of captured) {
+    const plainRegex = /\b\d{12}\b/g;
+    assert.equal(plainRegex.test(line), false, `plaintext Aadhaar leaked in console output: ${line}`);
+  }
 });

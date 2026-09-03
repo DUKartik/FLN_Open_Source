@@ -303,3 +303,57 @@ export async function detokenizeAadhaar(
 ): Promise<DetokenizeResult> {
   return detokenizeAadhaarImpl(params);
 }
+
+/**
+ * Read-only metadata about a persisted TOTP factor — the projection we
+ * expose over the wire. The `encryptedSecret` and any other secret
+ * material stays server-side; this envelope is for admin self-service UI
+ * only. `lastUsedAt` / `expiresAt` are ISO strings when present, `null`
+ * otherwise. `createdAt` is always an ISO string.
+ */
+export type MfaFactorMeta = {
+  factorId: string;
+  actor: string;
+  factorType: 'totp' | string;
+  status: 'active' | 'revoked' | string;
+  label: string | null;
+  algorithm: 'SHA1' | 'SHA256' | 'SHA512' | string;
+  digits: number;
+  period: number;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+  createdAt: string;
+};
+
+export type ListMfaFactorsParams = {
+  actor: string;
+};
+
+export type ListMfaFactorsResult = {
+  factors: MfaFactorMeta[];
+};
+
+export type ListMfaFactorsFn = (
+  params: ListMfaFactorsParams,
+) => Promise<ListMfaFactorsResult>;
+
+let listMfaFactorsImpl: ListMfaFactorsFn = async () => { throw NOT_CONFIGURED; };
+const listMfaFactorsImplDefault = listMfaFactorsImpl;
+
+export function __setListMfaFactorsImpl(fn: ListMfaFactorsFn | null): void {
+  listMfaFactorsImpl = fn === null ? listMfaFactorsImplDefault : fn;
+}
+
+/**
+ * List the caller's active TOTP factors, newest first. Used by the
+ * FLN-side enroll route to detect a returning admin and reuse the
+ * existing factor rather than mint a new secret every reveal. Only
+ * factors with `status: 'active'` are returned — revoked factors are
+ * hidden by design. The caller's identity is bound to the JWT subject
+ * by the route layer; this function does not authorize.
+ */
+export async function listMfaFactors(
+  params: ListMfaFactorsParams,
+): Promise<ListMfaFactorsResult> {
+  return listMfaFactorsImpl(params);
+}

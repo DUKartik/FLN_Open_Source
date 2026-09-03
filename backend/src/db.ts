@@ -1047,7 +1047,17 @@ export class DBStore {
     if (this.mongoDb) return await this.mongoDb.collection<ClassGroup>('classes').find({}).toArray();
     return this.data?.classes || [];
   }
-  async getStudents(opts?: { limit?: number; offset?: number; schoolId?: string | string[]; teacherId?: string }) {
+  async getStudents(opts?: { limit?: number; offset?: number; schoolId?: string | string[]; teacherId?: string; sort?: 'latest'; q?: string }) {
+    // Search must run BEFORE limit/offset. A previous version of this
+    // function only sorted/paged, and the caller (routes/students.ts)
+    // applied the search AFTER the paged result had been returned. On an
+    // 86,400-row collection that meant a search match at position 500
+    // would never appear in the page (the first 10 were the 10 most-recent
+    // inserts, with no guarantee any of them matched). The result was a
+    // panel that "did nothing" as the user typed. Pushing the search
+    // here means the same query Mongo/JS does is also the one that
+    // pagination slices.
+    const search = (opts?.q || '').trim().toLowerCase();
     if (this.mongoDb) {
       const filter: any = {};
       if (opts?.schoolId) {
@@ -1058,16 +1068,65 @@ export class DBStore {
         }
       }
       if (opts?.teacherId) filter.teacherId = opts.teacherId;
+      if (search) {
+        // Case-insensitive substring on the same six fields the panel
+        // advertises. Regex is unanchored so the user can match anywhere
+        // in the value (display ids, Aadhaar masks, school ids). The
+        // caller is expected to have escaped / length-bounded `search`
+        // upstream; in practice it's a trimmed, lowercased fragment of
+        // a query box, so the standard escape below is defensive.
+        const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const rx = new RegExp(escaped, 'i');
+        filter.$or = [
+          { name: rx },
+          { displayId: rx },
+          { aadharMasked: rx },
+          { schoolId: rx },
+          { classGroup: rx },
+          { section: rx },
+        ];
+      }
       const skip = opts?.offset || 0;
       const limit = opts?.limit || 0;
       const cursor = this.mongoDb.collection<Student>('students').find(filter);
+      // `sort: 'latest'` returns most-recently-inserted first. In Mongo
+      // the natural `_id` ObjectId is time-prefixed, so a descending
+      // sort gives the same intent as "newest at the top" in the
+      // file-fallback store (where students are `push`ed to the array
+      // and we reverse the result). Other sort modes are intentionally
+      // not exposed — the route layer is the only place that names
+      // sort orders.
+      if (opts?.sort === 'latest') cursor.sort({ _id: -1 });
       if (skip) cursor.skip(skip);
       if (limit) cursor.limit(limit);
       return await cursor.toArray();
     }
     let result = this.data?.students || [];
-    if (opts?.schoolId) result = result.filter(s => s.schoolId === opts.schoolId);
+    if (opts?.schoolId) {
+      const wanted = Array.isArray(opts.schoolId) ? opts.schoolId : [opts.schoolId];
+      result = result.filter(s => wanted.includes(s.schoolId));
+    }
     if (opts?.teacherId) result = result.filter(s => s.teacherId === opts.teacherId);
+    if (search) {
+      // Same six fields, same case-insensitive substring semantics as
+      // the Mongo $or above. Kept inline (not delegated to a helper)
+      // because the in-memory store only has one of each value, so
+      // there is no allocation pressure to share with the Mongo path.
+      result = result.filter(s => {
+        const fields = [
+          s.name, s.displayId, s.aadharMasked, s.schoolId, s.classGroup, s.section,
+        ];
+        for (const v of fields) {
+          if (v != null && String(v).toLowerCase().includes(search)) return true;
+        }
+        return false;
+      });
+    }
+    // For the file-fallback store, students are appended to the array
+    // on insert, so the array is in chronological order. Reversing it
+    // gives "latest first" — matching the Mongo sort({ _id: -1 })
+    // path.
+    if (opts?.sort === 'latest') result = [...result].reverse();
     if (opts?.offset) result = result.slice(opts.offset);
     if (opts?.limit) result = result.slice(0, opts.limit);
     return result;
@@ -1085,16 +1144,45 @@ export class DBStore {
     }
     return (this.data?.students || []).find(s => s.id === id) || null;
   }
-  async countStudents(opts?: { schoolId?: string; teacherId?: string }) {
+  async countStudents(opts?: { schoolId?: string; teacherId?: string; q?: string }) {
+    // Mirrors getStudents' search semantics so the route's X-Total-Count
+    // header reflects the full match count, not the post-pagination
+    // page count. The previous version took no `q` and the route fell
+    // back to `masked.length` (the post-page count) — same
+    // whole-collection / first-page mismatch that broke the search.
+    const search = (opts?.q || '').trim().toLowerCase();
     if (this.mongoDb) {
       const filter: any = {};
       if (opts?.schoolId) filter.schoolId = opts.schoolId;
       if (opts?.teacherId) filter.teacherId = opts.teacherId;
+      if (search) {
+        const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const rx = new RegExp(escaped, 'i');
+        filter.$or = [
+          { name: rx },
+          { displayId: rx },
+          { aadharMasked: rx },
+          { schoolId: rx },
+          { classGroup: rx },
+          { section: rx },
+        ];
+      }
       return await this.mongoDb.collection('students').countDocuments(filter);
     }
     let result = this.data?.students || [];
     if (opts?.schoolId) result = result.filter(s => s.schoolId === opts.schoolId);
     if (opts?.teacherId) result = result.filter(s => s.teacherId === opts.teacherId);
+    if (search) {
+      result = result.filter(s => {
+        const fields = [
+          s.name, s.displayId, s.aadharMasked, s.schoolId, s.classGroup, s.section,
+        ];
+        for (const v of fields) {
+          if (v != null && String(v).toLowerCase().includes(search)) return true;
+        }
+        return false;
+      });
+    }
     return result.length;
   }
 
@@ -1637,6 +1725,33 @@ export class DBStore {
     const set = new Set<string>();
     (this.data?.students || []).forEach(s => {
       if (aadhars.includes(s.aadharMasked)) set.add(s.aadharMasked);
+    });
+    return set;
+  }
+
+  /**
+   * School-scoped variant of `getExistingAadhars`. Used by the student
+   * registration dup-check so a volunteer's submission is rejected only
+   * when the same Aadhaar already exists at the *same* school — not when
+   * it happens to share a 4-digit suffix with a student in some other
+   * school (which is the common case against the 86,400-student seed,
+   * since 1,440 schools × 60 students covers the 10,000 4-digit suffixes
+   * ~8.6×). The cross-school "is this the same person?" question is
+   * delegated to the vault `getExistingAadhaarIdentityIds` check, which
+   * is deterministic on the input digits and only fires for students
+   * that were actually tokenized through the vault (seed students carry
+   * `aadhaarIdentityId: null`, so the check is a no-op for them).
+   */
+  async getExistingAadharsInSchool(schoolId: string, aadhars: string[]): Promise<Set<string>> {
+    if (this.mongoDb) {
+      const docs = await this.mongoDb.collection('students')
+        .find({ schoolId, aadharMasked: { $in: aadhars } }, { projection: { aadharMasked: 1 } })
+        .toArray();
+      return new Set(docs.map(d => d.aadharMasked));
+    }
+    const set = new Set<string>();
+    (this.data?.students || []).forEach(s => {
+      if (s.schoolId === schoolId && aadhars.includes(s.aadharMasked)) set.add(s.aadharMasked);
     });
     return set;
   }

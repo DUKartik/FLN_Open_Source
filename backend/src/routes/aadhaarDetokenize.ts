@@ -17,6 +17,8 @@
 //   3. Plain tokenization (registration) does NOT require MFA. Detokenization
 //      here goes through the vault's three-stage Step-Up workflow:
 //        (a) `enrollMfa`           — the admin enrolls a TOTP factor ONCE
+//                                    (returning admins reuse the existing
+//                                    factor; see `alreadyEnrolled` below)
 //        (b) `requestStepUp`       — mints a challenge bound to that factor
 //        (c) `approveStepUp`       — admin submits the TOTP code
 //        (d) `detokenize`          — consumes the approved challenge
@@ -35,7 +37,10 @@
 //      dialog close). It never enters MongoDB, never enters logs.
 //   7. TOTP secrets are NEVER stored in the FLN database. They live only in
 //      the vault (encrypted at rest) and in the admin's authenticator app
-//      (via the `otpauth://` URI returned from `enrollMfa`).
+//      (via the `otpauth://` URI returned from `enrollMfa`). They are
+//      NEVER returned over the wire on subsequent reveals — only the
+//      `factorId` of an existing factor is echoed back, and only on the
+//      FIRST enrollment is the `otpauthUri` sent.
 //
 // # Why these routes live separately from students.ts
 //
@@ -52,6 +57,7 @@ import {
   requestDetokenization,
   approveStepUpChallenge,
   detokenizeAadhaar,
+  listMfaFactors,
   VaultError,
   type EnrollMfaResult,
   type RequestDetokenizationResult,
@@ -149,12 +155,55 @@ function vaultErrorToHttp(err: VaultError, res: express.Response): void {
 
 export function registerAadhaarDetokenizeRoutes(app: express.Express): void {
   // ─────────────────────────────────────────────────────────────────────────
+  // 0. GET /api/students/:id/aadhaar/mfa/me
+  //
+  //    Pre-flight probe for the dialog. Returns the caller's active TOTP
+  //    factors (newest first) so the frontend can decide whether to show
+  //    the first-time QR/enrollment screen or the returning-admin
+  //    "enter your 6-digit code" screen. The `studentId` in the URL is
+  //    only a permission anchor (it is checked by `authorizeAndResolve
+  //    Student` so a non-admin cannot probe this endpoint). The returned
+  //    `factors` are SCOPED to the caller (`actor = JWT subject email`)
+  //    — the student id is never used to fetch factors. No encrypted
+  //    secret is exposed; the shape matches `MfaFactorMeta` on the
+  //    aadhaarVault shim.
+  // ─────────────────────────────────────────────────────────────────────────
+  app.get('/api/students/:id/aadhaar/mfa/me', async (req, res) => {
+    const student = await authorizeAndResolveStudent(req, res, req.params.id);
+    if (!student) return; // reply already sent (401/403/404/409)
+
+    const user = getAuthUser(req)!;
+    try {
+      const result = await listMfaFactors({ actor: user.email });
+      res.json(result);
+    } catch (err: any) {
+      if (err instanceof VaultError) return vaultErrorToHttp(err, res);
+      console.error('Aadhaar vault list-factors unexpected error:', err?.code ?? 'UNKNOWN', err?.message);
+      res.status(500).json({ error: 'vault_internal', message: 'Failed to read MFA factors.' });
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
   // 1. POST /api/students/:id/aadhaar/mfa/enroll
   //
   //    The admin enrolls a TOTP factor for THEMSELVES (not for the student).
-  //    Returns `{ factorId, otpauthUri }` so the frontend can render a QR
-  //    code. The admin scans it with an authenticator app, then types the
-  //    6-digit code into the Step-Up approve endpoint.
+  //    Two paths:
+  //      a. Returning admin — at least one active factor exists. The
+  //         route returns `{ factorId, alreadyEnrolled: true, factor }`
+  //         WITHOUT minting a new secret. The dialog skips the QR
+  //         screen and goes straight to the TOTP entry. The
+  //         `otpauthUri` is intentionally absent on this path so the
+  //         secret never re-crosses the wire.
+  //      b. First-time admin — no active factor. The route mints a
+  //         fresh factor via `enrollMfa` and returns
+  //         `{ factorId, otpauthUri, factor, alreadyEnrolled: false }`.
+  //         The dialog renders the QR for the admin to scan once.
+  //
+  //    The same TOTP secret is bound to the same `actor` for the
+  //    lifetime of the admin's enrollment. The browser does not
+  //    persist the secret; only the admin's authenticator app holds
+  //    it (and a `manual setup URI` toggle in the dialog lets them
+  //    re-add the account on a new device).
   // ─────────────────────────────────────────────────────────────────────────
   app.post('/api/students/:id/aadhaar/mfa/enroll', async (req, res) => {
     const user = getAuthUser(req);
@@ -169,6 +218,33 @@ export function registerAadhaarDetokenizeRoutes(app: express.Express): void {
       ? req.body.label
       : `FLN admin (${user.email})`;
 
+    // ── Returning-admin path: reuse the existing factor. ─────────────
+    // We look up the caller's active factors BEFORE minting a new
+    // secret. If any exist we echo the most recent factorId back so
+    // the dialog can skip enrollment and the step-up request can
+    // bind to it directly. The actor binding is the JWT subject
+    // (user.email), so a different admin can never observe or
+    // collide with this lookup.
+    try {
+      const existing = await listMfaFactors({ actor: user.email });
+      if (existing.factors.length > 0) {
+        const f = existing.factors[0];
+        res.json({
+          factorId: f.factorId,
+          alreadyEnrolled: true,
+          factor: f,
+        });
+        return;
+      }
+    } catch (err: any) {
+      if (err instanceof VaultError) return vaultErrorToHttp(err, res);
+      // A factor-list failure should not block a first-time enrollment
+      // — fall through to the enroll path. We still log it so a
+      // regression on the read side is visible in ops.
+      console.warn('Aadhaar vault list-factors in enroll handler:', err?.code ?? 'UNKNOWN', err?.message);
+    }
+
+    // ── First-time-admin path: mint a new TOTP factor. ──────────────
     try {
       const result: EnrollMfaResult = await enrollMfa({
         actor: user.email,
@@ -182,6 +258,7 @@ export function registerAadhaarDetokenizeRoutes(app: express.Express): void {
       res.json({
         factorId: result.factorId,
         otpauthUri: result.otpauthUri,
+        alreadyEnrolled: false,
         // Projected factor envelope (no encryptedSecret on the wire for the
         // admin UI — they only need the QR; the secret is already in their
         // authenticator).
