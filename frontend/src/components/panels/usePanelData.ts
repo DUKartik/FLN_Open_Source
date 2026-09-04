@@ -14,7 +14,13 @@ import { DISTRICT_NAMES, BLOCK_NAMES } from '../../constants';
 // Panels that render without ever reading the `students` variable — skipping
 // the fetch on these avoids an up-to-86,400-record national payload on
 // screens that don't display any student data.
-const STUDENTS_NOT_NEEDED_PANELS = new Set(['users', 'worksheet_templates', 'content', 'system_settings']);
+const STUDENTS_NOT_NEEDED_PANELS = new Set([
+  'aadhaar_reveal',  // Panel does its own paged + debounced-server-search fetch; the up-to-86k-row firehose is unused.
+  'users',
+  'worksheet_templates',
+  'content',
+  'system_settings',
+]);
 
 const TEACHERS_MOCK = [
   { id: 't1', name: 'Ritu Sharma', email: 'gps-mt-001.t01@fln.org', schoolId: 'gps-mt-001', classes: ['Class 2-A', 'Class 3-A'], studentsCount: 42, delayedAttempts: 0, status: 'Active' },

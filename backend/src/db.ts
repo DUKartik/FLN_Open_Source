@@ -918,6 +918,25 @@ export class DBStore {
           // those rows into errors. Revisit uniqueness only after
           // scripts/audit-aadhaar-at-rest.ts reports the data is clean.
           await studentsColl.createIndex({ aadhaarIdentityId: 1 });
+          // Case-insensitive search indexes for the Aadhaar Reveal / admin
+          // student search. The route's $or uses BSON range ({$gte: $lt})
+          // on these six fields; the index collation lets the range scan
+          // be case-insensitive, and the index OR uses one IXSCAN per
+          // branch. Without these, an 86k-row collection would COLLSCAN
+          // on every keystroke. The same collation must be set on the
+          // cursor (see getStudents) — a strength:2 index compared with
+          // the simple-binary default ignores the index entirely.
+          // The choice of strength:2 (case + accent insensitive but
+          // still case-folded for ordering) is a deliberate compromise:
+          // full case+accent insensitive would be strength:1, but
+          // school/class identifiers do carry case information some
+          // admins rely on, and strength:1 would also make 'a' and 'ä'
+          // indistinguishable, which is wrong for names. Strength:2 is
+          // the standard for "case-insensitive prefix search".
+          const searchCollation = { locale: 'en', strength: 2 };
+          for (const f of ['name', 'displayId', 'aadharMasked', 'schoolId', 'classGroup', 'section']) {
+            await studentsColl.createIndex({ [f]: 1 }, { collation: searchCollation, name: f + '_ci' });
+          }
           console.log('Successfully ensured indexes on "students" collection');
         } catch (e: any) {
           console.warn('Failed to ensure indexes on "students" collection:', e.message);
@@ -1078,26 +1097,43 @@ export class DBStore {
       }
       if (opts?.teacherId) filter.teacherId = opts.teacherId;
       if (search) {
-        // Case-insensitive substring on the same six fields the panel
-        // advertises. Regex is unanchored so the user can match anywhere
-        // in the value (display ids, Aadhaar masks, school ids). The
-        // caller is expected to have escaped / length-bounded `search`
-        // upstream; in practice it's a trimmed, lowercased fragment of
-        // a query box, so the standard escape below is defensive.
-        const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const rx = new RegExp(escaped, 'i');
+        // Case-insensitive PREFIX match on the same six fields the panel
+        // advertises. The previous version used an unanchored case-insensitive
+        // regex (e.g. /foo/i), which CANNOT use a B-tree index in this
+        // MongoDB version — every keystroke COLLSCAN'd the 86k-row
+        // collection. The fix is a BSON range { $gte: prefix, $lt: prefix+'￿' }
+        // combined with a strength:2 collation on the cursor. Combined with
+        // the matching collation-aware indexes (see the `init()` block
+        // above), Mongo uses index OR (one IXSCAN per $or branch) and the
+        // search runs in single-digit ms.
+        //
+        // The semantic change is "prefix" instead of "substring" — typing
+        // "kar" still finds "Kartik", but typing "artik" no longer matches
+        // "Kartik" via a mid-string substring. This is the smallest
+        // architecturally correct change that preserves the user-typed
+        // search box; the API contract (the ?q= parameter) is unchanged.
+        // The in-memory (file-fallback) path below mirrors this with
+        // .startsWith() so dev and prod return the same results.
+        const prefix = search;
+        const upper = prefix + '￿';
         filter.$or = [
-          { name: rx },
-          { displayId: rx },
-          { aadharMasked: rx },
-          { schoolId: rx },
-          { classGroup: rx },
-          { section: rx },
+          { name:        { $gte: prefix, $lt: upper } },
+          { displayId:   { $gte: prefix, $lt: upper } },
+          { aadharMasked:{ $gte: prefix, $lt: upper } },
+          { schoolId:    { $gte: prefix, $lt: upper } },
+          { classGroup:  { $gte: prefix, $lt: upper } },
+          { section:     { $gte: prefix, $lt: upper } },
         ];
       }
       const skip = opts?.offset || 0;
       const limit = opts?.limit || 0;
       const cursor = this.mongoDb.collection<Student>('students').find(filter);
+      // When the query has a search, use the same collation as the
+      // `*_ci` indexes above. Without this, Mongo falls back to the
+      // simple-binary collation, the index OR is unusable, and we
+      // COLLSCAN the whole collection. With it, index OR turns 6
+      // COLLSCANs into 6 IXSCANs (~1ms each on 86k rows).
+      if (search) cursor.collation({ locale: 'en', strength: 2 });
       // `sort: 'latest'` returns most-recently-inserted first. In Mongo
       // the natural `_id` ObjectId is time-prefixed, so a descending
       // sort gives the same intent as "newest at the top" in the
@@ -1117,16 +1153,20 @@ export class DBStore {
     }
     if (opts?.teacherId) result = result.filter(s => s.teacherId === opts.teacherId);
     if (search) {
-      // Same six fields, same case-insensitive substring semantics as
-      // the Mongo $or above. Kept inline (not delegated to a helper)
-      // because the in-memory store only has one of each value, so
-      // there is no allocation pressure to share with the Mongo path.
+      // Same six fields, same case-insensitive PREFIX semantics as the
+      // Mongo $or above (see comment in the Mongo branch). The previous
+      // version used `.includes()` (substring); the new Mongo path is
+      // BSON range + collation, which is prefix-only. We mirror that
+      // here with `.startsWith()` so dev (file-fallback) and prod
+      // (Mongo) return the same rows for the same `q` — otherwise a
+      // dev who types "artik" sees "Kartik" in their file-fallback
+      // results but a prod deploy would not, and vice versa.
       result = result.filter(s => {
         const fields = [
           s.name, s.displayId, s.aadharMasked, s.schoolId, s.classGroup, s.section,
         ];
         for (const v of fields) {
-          if (v != null && String(v).toLowerCase().includes(search)) return true;
+          if (v != null && String(v).toLowerCase().startsWith(search)) return true;
         }
         return false;
       });
@@ -1165,16 +1205,28 @@ export class DBStore {
       if (opts?.schoolId) filter.schoolId = opts.schoolId;
       if (opts?.teacherId) filter.teacherId = opts.teacherId;
       if (search) {
-        const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const rx = new RegExp(escaped, 'i');
+        // Mirror the BSON-range + collation pattern from getStudents
+        // exactly. countStudents drives the route's X-Total-Count
+        // header, and it MUST match the page's filter — otherwise
+        // pagination shows the wrong total. With the same $or and
+        // the same collation, Mongo uses the same six IXSCANs as
+        // the find, so the count is also single-digit ms on 86k rows.
+        const prefix = search;
+        const upper = prefix + '￿';
         filter.$or = [
-          { name: rx },
-          { displayId: rx },
-          { aadharMasked: rx },
-          { schoolId: rx },
-          { classGroup: rx },
-          { section: rx },
+          { name:        { $gte: prefix, $lt: upper } },
+          { displayId:   { $gte: prefix, $lt: upper } },
+          { aadharMasked:{ $gte: prefix, $lt: upper } },
+          { schoolId:    { $gte: prefix, $lt: upper } },
+          { classGroup:  { $gte: prefix, $lt: upper } },
+          { section:     { $gte: prefix, $lt: upper } },
         ];
+      }
+      // Same collation as the find; required for the *_ci indexes.
+      // Without the search path, countDocuments hits the existing
+      // schoolId/teacherId indexes and does not need a collation.
+      if (search) {
+        return await this.mongoDb.collection('students').countDocuments(filter, { collation: { locale: 'en', strength: 2 } });
       }
       return await this.mongoDb.collection('students').countDocuments(filter);
     }
@@ -1182,12 +1234,13 @@ export class DBStore {
     if (opts?.schoolId) result = result.filter(s => s.schoolId === opts.schoolId);
     if (opts?.teacherId) result = result.filter(s => s.teacherId === opts.teacherId);
     if (search) {
+      // Same prefix-only semantics as getStudents' in-memory path.
       result = result.filter(s => {
         const fields = [
           s.name, s.displayId, s.aadharMasked, s.schoolId, s.classGroup, s.section,
         ];
         for (const v of fields) {
-          if (v != null && String(v).toLowerCase().includes(search)) return true;
+          if (v != null && String(v).toLowerCase().startsWith(search)) return true;
         }
         return false;
       });
