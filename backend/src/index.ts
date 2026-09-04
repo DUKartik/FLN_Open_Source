@@ -39,6 +39,8 @@ import { registerWorksheetRoutes } from './routes/worksheets';
 import { registerEvaluationRoutes } from './routes/evaluation';
 import { registerAnalyticsRoutes } from './routes/analytics';
 import { registerQuestionLogicRoutes } from './routes/questionLogics';
+import { registerQuestionTemplateRoutes } from './routes/questionTemplates';
+import { registerQuestionOptionRoutes } from './routes/questionOptions';
 import { registerDiagnosticBulkRoutes } from './routes/diagnosticBulk';
 import { registerMisconceptionRoutes } from './routes/misconceptions';
 import { registerCurriculumRoutes } from './routes/curriculum';
@@ -249,6 +251,8 @@ registerStatsRoutes(app);
   registerWorksheetRoutes(app);
   registerAnalyticsRoutes(app);
   registerQuestionLogicRoutes(app);
+  registerQuestionTemplateRoutes(app);
+  registerQuestionOptionRoutes(app);
   registerDiagnosticBulkRoutes(app);
 
   // Read-only analysis over already-graded submissions: clusters a cohort on

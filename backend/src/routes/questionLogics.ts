@@ -1,7 +1,7 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
-import { dbStore, UserRole, QuestionLogic } from '../db';
-import { getAuthUser } from '../auth';
+import { dbStore, QuestionLogic } from '../db';
+import { requireSuperadmin } from './superadminGuard';
 import {
   LEVEL_COUNT,
   getLevel,
@@ -13,20 +13,6 @@ import {
 const MAX_LOGIC_CHARS = 2000;
 /** Window for the accidental-double-click guard. Not a uniqueness constraint on pedagogy. */
 const DUPLICATE_WINDOW_MS = 60_000;
-
-/**
- * Every route here is Superadmin-only. Authoring question logic is a curriculum
- * decision, and the 7-role hierarchy has no curriculum-author role — widening
- * this later is a one-line change here.
- */
-function requireSuperadmin(req: express.Request, res: express.Response) {
-  const user = getAuthUser(req);
-  if (!user || user.role !== UserRole.SUPERADMIN) {
-    res.status(403).json({ error: 'Only superadmins can manage question logics.' });
-    return null;
-  }
-  return user;
-}
 
 /**
  * Server-side validation of a (level, skills, subskills, text) combination.

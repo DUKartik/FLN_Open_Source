@@ -9,7 +9,7 @@ import { UserCheck, CheckCircle2, XCircle } from 'lucide-react';
 import { Table, Column } from '../Table';
 import { SuperAdminExecutiveDashboard } from '../SuperAdminExecutiveDashboard';
 import { RegionalAnalyticsView } from './RegionalAnalyticsView';
-import { QuestionInterventionPanel } from '../panels/QuestionInterventionPanel';
+import { QuestionTemplatePanel } from '../panels/QuestionTemplatePanel';
 import { CurriculumLevelsPanel } from '../panels/CurriculumLevelsPanel';
 import { QuestionReviewPanel } from '../panels/QuestionReviewPanel';
 
@@ -689,7 +689,7 @@ export const SuperadminDashboard: React.FC<DashboardProps> = ({ user, token }) =
       )}
 
       {activeTab === 'intervention' && (
-        <QuestionInterventionPanel />
+        <QuestionTemplatePanel />
       )}
 
       {activeTab === 'curriculum' && (

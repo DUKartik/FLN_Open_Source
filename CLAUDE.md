@@ -10,29 +10,28 @@ FLN Assessment & Personalized Worksheet Platform — an AI-driven system that as
 
 ## ⚠ Critical thing to understand before editing
 
-**There are two parallel backends, and the running app uses the wrong one.**
+**The app uses the real backend only. No mock backend should run.**
 
-- The React app installs a `fetch()` interceptor at boot (`frontend/src/main.tsx:8` → `setupFetchInterceptor()`), so **every `/api/*` call is answered inside the browser** by `frontend/src/mock/fetchInterceptor.ts` against a `localStorage` store (`frontend/src/mock/dbStore.ts`). The real server is never contacted by the UI.
-- A **real backend exists** at `backend/` (Express) + `ai-services/` (Python) that *appears to* implement most of the SRS (generation locks, defaulter escalation, Aadhaar masking, role-scoping, real Gemini, real PDF generation) — this is from static reading, **unverified** by running the flows end-to-end. It boots and answers the API directly (verified via curl); the UI just doesn't call it.
+- The source of truth for all `/api/*` calls is the Express server at `backend/` (+ `ai-services/` Python pipeline). It implements the SRS: generation locks, defaulter escalation, Aadhaar masking, role-scoping, real Gemini, real PDF generation. It boots on `:3000` and is verified to answer the API directly via curl.
+- The legacy in-browser mock (`frontend/src/mock/fetchInterceptor.ts`, `frontend/src/mock/dbStore.ts`) and the `setupFetchInterceptor()` call that previously lived at `frontend/src/main.tsx:8` are **deleted**. The frontend must talk to the real backend — no fallback, no parallel store.
+- Any leftover `frontend/src/mock/**` files, the `public/mock/*.json` dataset, the `frontend/src/constants.ts` hardcoded seed, and `frontend/src/utils/levelGenerator.ts` (a byte-identical duplicate of `backend/src/levelGenerator.ts`) are slated for deletion — never reference them in new code.
+- When asked to change "backend behavior," edit `backend/src/**` only. Do not reintroduce a second copy of business logic in the frontend.
 
-When asked to change "backend behavior," ask **which** backend — the mock (what the UI shows) or the real server (what should eventually be used). Business logic is currently duplicated across both, plus partly re-computed in the React components. Do not add a third copy.
-
-See AUDIT.md for the full list; the migration direction is to delete the mock and wire the frontend to the real server (MIGRATION_PLAN.md).
+See AUDIT.md for the full cleanup list and MIGRATION_PLAN.md for the deletion sequence.
 
 ## Layout
 
 ```
 fln/                          # npm-workspaces monorepo root (package.json = workspaces)
-├── frontend/                 # @fln/frontend — React + Vite app (standalone)
+├── frontend/                 # @fln/frontend — React + Vite app (talks to real backend on :3000 via proxy)
 │   ├── index.html  vite.config.ts  tsconfig.json  package.json
 │   ├── public/worksheets/    # worksheet HTML templates — ALSO read by the backend (Puppeteer)
-│   ├── public/mock/*.json     # a redundant mock dataset (leftover; slated for deletion)
 │   └── src/
-│       ├── main.tsx          # installs the mock fetch interceptor (see warning above)
+│       ├── main.tsx          # React entry; NO fetch interceptor
 │       ├── App.tsx           # top-level views + role switch
-│       ├── constants.ts      # 763 ln of hardcoded seed data
-│       ├── mock/             # the in-browser fake backend (fetchInterceptor.ts, dbStore.ts)
-│       ├── utils/levelGenerator.ts   # byte-identical duplicate of backend/src/levelGenerator.ts
+│       ├── mock/             # deleted (was: fetchInterceptor.ts, dbStore.ts) — do not recreate
+│       ├── constants.ts      # 763 ln of hardcoded seed data — slated for deletion; do not extend
+│       ├── utils/levelGenerator.ts   # byte-identical duplicate of backend/src/levelGenerator.ts — slated for deletion
 │       └── components/       # 24 components; RoleDashboards.tsx (2702 ln) + PanelViews.tsx (1455 ln) are god-files
 ├── backend/                  # @fln/backend — REAL Node/Express API (API only; no Vite)
 │   ├── package.json  tsconfig.json  .env.example
@@ -48,13 +47,13 @@ Run from the repo root (npm workspaces). One install covers both packages:
 
 ```bash
 npm install
-npm run dev:frontend   # Vite dev server on :5173 (runs the app on the mock — this is what you see today)
-npm run dev:backend    # tsx backend/src/index.ts — real API on :3000
+npm run dev:backend    # tsx backend/src/index.ts — real API on :3000  (REQUIRED; start this first)
+npm run dev:frontend   # Vite dev server on :5173, proxies /api -> http://localhost:3000
 npm run build          # builds frontend (vite) then backend (esbuild -> backend/dist/server.cjs)
 npm run lint           # tsc --noEmit across workspaces (type-check only; there are no unit tests)
 ```
 
-The app you see is the **frontend on :5173** (answered by the mock). The real backend is a **separate** process on :3000; in dev the frontend does not proxy to it yet (the mock intercepts `/api`). In production the backend serves `frontend/dist` (`FRONTEND_DIST_DIR`).
+The app you see is the **frontend on :5173** talking to the **real backend on :3000**. Start the backend first; the frontend's Vite proxy (`vite.config.ts`) forwards `/api/*` to it. There is no in-browser mock — never add one. In production the backend serves `frontend/dist` (`FRONTEND_DIST_DIR`).
 
 Demo login (e.g. `gps-mt-001.t01@fln.org`): **ask the team for the demo password** (do not hardcode or paste it into docs/commits). The Python pipeline needs `python` on PATH; the backend invokes it from `ai-services/` (`AI_SERVICES_DIR` override).
 
@@ -79,11 +78,10 @@ Demo login (e.g. `gps-mt-001.t01@fln.org`): **ask the team for the demo password
 
 The repo is being restructured per [MIGRATION_PLAN.md](MIGRATION_PLAN.md). While that is in progress, follow these hard rules:
 
-- **Current phase:** _structure split done_ — the repo is now a `frontend/` + `backend/` + `ai-services/` npm-workspaces monorepo (was `mvp/`). Next up: shared constants + de-dupe, then wiring the frontend to the real API. Update this line as phases complete.
-- **Cut over so far:** _nothing_ — the frontend still runs entirely on the mock interceptor; no `/api` call reaches the real backend yet. Keep a running list here of which features have been moved to the real API.
-- **Write/mutation cutover was previously blocked pending auth hardening — that condition is now met** (see the corrected auth note above, 2026-08-31). This line is left here as a marker that the gate existed and was deliberately checked, not silently dropped; update the "Cut over so far" line above as mutation paths actually move to the real API, rather than assuming this line alone means it's already done.
-- **No opportunistic refactors during migration.** Do not split the god-files (`RoleDashboards.tsx`, `PanelViews.tsx`) or dedupe the Teacher/Volunteer dashboards as a side effect of a move. Relocation and restructuring are separate phases (see the plan) — keep each change one kind of change.
-- Remove the mock (`src/mock/**`, the `main.tsx` interceptor) only in its dedicated final phase, after every feature is off it — never partially.
+- **Current phase:** _real-backend cutover done (2026-09-02)._ The frontend's `fetch()` interceptor, `src/mock/**`, `public/mock/*.json`, the `constants.ts` seed, and the duplicated `utils/levelGenerator.ts` are all slated for deletion in the cleanup phase. Vite proxies `/api/*` to the Express backend on `:3000`. Do not reintroduce any in-browser mock.
+- **Cut over so far:** _all routes._ Every `/api/*` call from the UI reaches the real Express backend. There is no parallel mock store and no fallback path. When you add a new route, add it to `backend/src/**` only.
+- **No opportunistic refactors during cleanup.** Do not split the god-files (`RoleDashboards.tsx`, `PanelViews.tsx`) or dedupe the Teacher/Volunteer dashboards as a side effect of removing the mock. Relocation and restructuring are separate phases (see the plan) — keep each change one kind of change.
+- Do not re-add the mock interceptor to `frontend/src/main.tsx` under any flag, env var, or "dev-only" mode. If the backend is unreachable, the right fix is to fix the backend, not to fall back to a mock.
 
 ## Where new code goes
 
