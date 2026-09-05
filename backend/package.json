@@ -22,7 +22,8 @@
     "test:search-index": "tsx --test tests/students-search-index.test.ts",
     "test:panel-isolation": "tsx --test tests/panel-isolation.test.cjs",
     "audit:aadhaar": "tsx scripts/audit-aadhaar-at-rest.ts",
-    "test:answer-matching": "tsx src/answerMatching.test.ts"
+    "test:answer-matching": "tsx src/answerMatching.test.ts",
+    "test:paper-lock": "tsx src/paperLock.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

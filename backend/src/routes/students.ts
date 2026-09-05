@@ -234,6 +234,33 @@ export function registerStudentRoutes(app: express.Express) {
     res.json(masked);
   });
 
+  // Returns a map of studentId -> { generatedByEmail, createdAt } for
+  // every student who currently has a diagnostic paper (locked for
+  // re-generation under the per-student cycle lock). The frontend uses
+  // this to hide already-placed students from the selective-generation
+  // dropdown — currentLevel-based filtering is not enough because a
+  // paper can be generated but not yet graded/scanned, leaving
+  // currentLevel still null.
+  app.get('/api/students/locks', async (req, res) => {
+    const user = getAuthUser(req);
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+    const locks = await dbStore.getStudentCycleLocks();
+    const map: Record<string, { generatedByEmail: string; createdAt: string; paperType: string; cycle: string }> = {};
+    for (const l of locks) {
+      // Only surface diagnostic-paper locks; remedial/practice/etc. are
+      // not in PAPER_TYPES_THAT_LOCK so this is mostly defensive.
+      if (l.paperType === 'diagnostic') {
+        map[l.studentId] = {
+          generatedByEmail: l.generatedByEmail,
+          createdAt: l.createdAt,
+          paperType: l.paperType,
+          cycle: l.cycle,
+        };
+      }
+    }
+    res.json({ locks: map });
+  });
+
   // Get or generate student's assigned 10-question FLN paper from MongoDB Atlas (Class 2: Levels 22 to 31)
   app.get('/api/students/:id/diagnostic-paper', async (req, res) => {
     const user = getAuthUser(req);
